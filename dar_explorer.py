@@ -48,78 +48,91 @@ class DarNode(GObject.Object):
 
 
 def build_tree(entries: list[ParsedEntry]):
-    # Reiner Python-Zwischenspeicher für die Hierarchie
-    # Struktur: { "pfad": [Liste von direkten Kinder-Knoten] }
-    raw_tree: dict[str, list[DarNode]] = {}
-    nodes: dict[str, DarNode] = {}
-    roots: list[DarNode] = []
+    roots = {}
+    nodes = {}
 
-    # 1. SCHRITT: Alle Knoten erzeugen und hierarchisch zuordnen
-    for entry in entries:
+    immich_in_entries = sum(1 for e in entries if "immich" in e.path.lower())
+    immich_nodes_created = 0
+
+    sorted_entries = sorted(entries, key=lambda e: (e.path.count("/"), e.path.casefold()))
+
+    for entry in sorted_entries:
         clean = entry.path.strip("/")
         if not clean:
             continue
 
         parts = clean.split("/")
+        parent = None
         current_path = ""
-        parent_path = ""
 
         for index, part in enumerate(parts):
             current_path = part if not current_path else f"{current_path}/{part}"
             is_last = (index == len(parts) - 1)
 
-            if current_path not in nodes:
-                # Knoten erstellen (als Datei oder virtuellen/echten Ordner)
+            node = nodes.get(current_path)
+
+            if node is None:
+                if "immich" in current_path.lower():
+                    immich_nodes_created += 1
+
                 node = DarNode(
                     part,
                     current_path,
                     entry.is_dir if is_last else True,
                     entry.permissions if is_last else "drwxr-xr-x",
-                    entry.user if is_last else "root",
-                    entry.group if is_last else "root",
+                    entry.user if is_last else "unknown",
+                    entry.group if is_last else "unknown",
                     entry.size if is_last else "—",
                     entry.date if is_last else "—",
                 )
                 nodes[current_path] = node
 
-                # Dem Elternpfad zuordnen
-                if index == 0:
-                    roots.append(node)
+                if parent is None:
+                    roots[part] = node
                 else:
-                    if parent_path not in raw_tree:
-                        raw_tree[parent_path] = []
-                    raw_tree[parent_path].append(node)
-            elif is_last:
-                # Metadaten aktualisieren, falls der Knoten zuvor nur virtuell angelegt wurde
-                node = nodes[current_path]
-                node.is_dir = entry.is_dir
-                node.permissions = entry.permissions
-                node.user = entry.user
-                node.group = entry.group
-                node.size = entry.size
-                node.date = entry.date
+                    parent.children.append(node)
+            else:
+                if is_last:
+                    node.is_dir = entry.is_dir
+                    node.permissions = entry.permissions
+                    node.user = entry.user
+                    node.group = entry.group
+                    node.size = entry.size
+                    node.date = entry.date
 
-            parent_path = current_path
+            parent = node
 
-    # 2. SCHRITT: Kinder sortieren und ERST JETZT in die Gio.ListStores übertragen
-    def finalize_and_sort(node: DarNode):
-        child_list = raw_tree.get(node.path, [])
-        if child_list:
-            # Ordner nach oben, Dateien nach unten, alphabetisch sortiert
-            child_list.sort(key=lambda n: (not n.is_dir, n.name.casefold()))
+    # Prüfen, ob Immich-Knoten Kinder im Speicher haben
+    immich_children_count = 0
+    for path, node in nodes.items():
+        if "immich" in path.lower():
+            immich_children_count += node.children.get_n_items()
 
-            store = Gio.ListStore.new(DarNode)
-            for child in child_list:
-                finalize_and_sort(child) # Erst die Tiefe auflösen
-                store.append(child)
-            node.children = store
+    print("\n" + "="*50)
+    print("DEBUG: BUILD_TREE STATISTIK")
+    print(f"Vom Parser übergebene Immich-Pfade: {immich_in_entries}")
+    print(f"Erstellte Immich-DarNodes im Speicher: {immich_nodes_created}")
+    print(f"Summe der Kinder-Elemente in allen Immich-Knoten: {immich_children_count}")
+    print(f"Wurzel-Knoten (Roots) in der GUI gesamt: {len(roots)}")
+    print("="*50 + "\n")
 
-    # Wurzel-Ebene sortieren und finalisieren
-    roots.sort(key=lambda n: (not n.is_dir, n.name.casefold()))
+    def sort_node(node):
+        children = [node.children.get_item(i) for i in range(node.children.get_n_items())]
+        children.sort(key=lambda n: (not n.is_dir, n.name.casefold()))
+        store = Gio.ListStore.new(DarNode)
+        for child in children:
+            sort_node(child)
+            store.append(child)
+        node.children = store
+
+    root_nodes = list(roots.values())
+    root_nodes.sort(key=lambda n: (not n.is_dir, n.name.casefold()))
+    for node in root_nodes:
+        sort_node(node)
+
     root_store = Gio.ListStore.new(DarNode)
-    for root_node in roots:
-        finalize_and_sort(root_node)
-        root_store.append(root_node)
+    for node in root_nodes:
+        root_store.append(node)
 
     return root_store, list(nodes.values())
 
