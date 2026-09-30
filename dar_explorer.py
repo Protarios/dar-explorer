@@ -48,15 +48,12 @@ class DarNode(GObject.Object):
 
 
 def build_tree(entries: list[ParsedEntry]):
-    # tree_structure speichert: { "Absoluter_Elternpfad": [Liste von DarNode-Kindern] }
+    # tree_structure speichert: { "Absoluter_Elternpfad": [Liste von direkten DarNode-Kindern] }
     tree_structure = {}
     nodes = {}
-    roots = {}
+    roots = []
 
-    # Sortierung nach Pfadlänge stellt sicher, dass Eltern vor Kindern kommen
-    sorted_entries = sorted(entries, key=lambda e: (e.path.count("/"), e.path.casefold()))
-
-    for entry in sorted_entries:
+    for entry in entries:
         clean = entry.path.strip("/")
         if not clean:
             continue
@@ -66,43 +63,41 @@ def build_tree(entries: list[ParsedEntry]):
         parent_path = ""
 
         for index, part in enumerate(parts):
-            # current_path ist der weltweit eindeutige absolute Pfad (z.B. 'Pictures/Immich' vs 'Immich')
+            # Absoluter Vollpfad sichert die Eindeutigkeit bei gleichen Ordnernamen
             current_path = part if not current_path else f"{current_path}/{part}"
             is_last = (index == len(parts) - 1)
 
-            node = nodes.get(current_path)
-
-            if node is None:
+            if current_path not in nodes:
                 node = DarNode(
-                    part,
-                    current_path,
+                    part, current_path,
                     entry.is_dir if is_last else True,
                     entry.permissions if is_last else "drwxr-xr-x",
                     entry.user if is_last else "unknown",
                     entry.group if is_last else "unknown",
                     entry.size if is_last else "—",
-                    entry.date if is_last else "—",
+                    entry.date if is_last else "—"
                 )
                 nodes[current_path] = node
 
                 if index == 0:
-                    roots[part] = node
+                    roots.append(node)
                 else:
                     if parent_path not in tree_structure:
                         tree_structure[parent_path] = []
                     tree_structure[parent_path].append(node)
-            else:
-                if is_last:
-                    node.is_dir = entry.is_dir
-                    node.permissions = entry.permissions
-                    node.user = entry.user
-                    node.group = entry.group
-                    node.size = entry.size
-                    node.date = entry.date
+            elif is_last:
+                # Nur Metadaten aktualisieren, falls der Knoten zuvor virtuell erstellt wurde
+                node = nodes[current_path]
+                node.is_dir = entry.is_dir
+                node.permissions = entry.permissions
+                node.user = entry.user
+                node.group = entry.group
+                node.size = entry.size
+                node.date = entry.date
 
             parent_path = current_path
 
-    # Wenn die reine Python-Struktur steht, befüllen wir die GTK-Stores
+    # Wenn die reine Python-Struktur steht, befüllen wir die GTK-Stores in linearer Zeit
     def populate_gtk_children(node):
         children_nodes = tree_structure.get(node.path, [])
         if children_nodes:
@@ -111,20 +106,14 @@ def build_tree(entries: list[ParsedEntry]):
                 populate_gtk_children(child)
                 node.children.append(child)
 
-    root_nodes = list(roots.values())
-    root_nodes.sort(key=lambda n: (not n.is_dir, n.name.casefold()))
-
+    roots.sort(key=lambda n: (not n.is_dir, n.name.casefold()))
     root_store = Gio.ListStore.new(DarNode)
-    for root_node in root_nodes:
+    for root_node in roots:
         populate_gtk_children(root_node)
         root_store.append(root_node)
 
-    # REINES LOGGING ZUR KONTROLLE
-    print(f"DEBUG_FINAL: Wurzelknoten 'Immich' vorhanden? {'Immich' in roots}")
-    if 'Immich' in roots:
-        print(f"DEBUG_FINAL: Kinder im Wurzelknoten 'Immich': {roots['Immich'].children.get_n_items()}")
-
     return root_store, list(nodes.values())
+
 
 
 
