@@ -48,12 +48,12 @@ class DarNode(GObject.Object):
 
 
 def build_tree(entries: list[ParsedEntry]):
-    roots = {}
+    # tree_structure speichert: { "Absoluter_Elternpfad": [Liste von DarNode-Kindern] }
+    tree_structure = {}
     nodes = {}
+    roots = {}
 
-    immich_in_entries = sum(1 for e in entries if "immich" in e.path.lower())
-    immich_nodes_created = 0
-
+    # Sortierung nach Pfadlänge stellt sicher, dass Eltern vor Kindern kommen
     sorted_entries = sorted(entries, key=lambda e: (e.path.count("/"), e.path.casefold()))
 
     for entry in sorted_entries:
@@ -62,19 +62,17 @@ def build_tree(entries: list[ParsedEntry]):
             continue
 
         parts = clean.split("/")
-        parent = None
         current_path = ""
+        parent_path = ""
 
         for index, part in enumerate(parts):
+            # current_path ist der weltweit eindeutige absolute Pfad (z.B. 'Pictures/Immich' vs 'Immich')
             current_path = part if not current_path else f"{current_path}/{part}"
             is_last = (index == len(parts) - 1)
 
             node = nodes.get(current_path)
 
             if node is None:
-                if "immich" in current_path.lower():
-                    immich_nodes_created += 1
-
                 node = DarNode(
                     part,
                     current_path,
@@ -87,10 +85,12 @@ def build_tree(entries: list[ParsedEntry]):
                 )
                 nodes[current_path] = node
 
-                if parent is None:
+                if index == 0:
                     roots[part] = node
                 else:
-                    parent.children.append(node)
+                    if parent_path not in tree_structure:
+                        tree_structure[parent_path] = []
+                    tree_structure[parent_path].append(node)
             else:
                 if is_last:
                     node.is_dir = entry.is_dir
@@ -100,39 +100,29 @@ def build_tree(entries: list[ParsedEntry]):
                     node.size = entry.size
                     node.date = entry.date
 
-            parent = node
+            parent_path = current_path
 
-    # Prüfen, ob Immich-Knoten Kinder im Speicher haben
-    immich_children_count = 0
-    for path, node in nodes.items():
-        if "immich" in path.lower():
-            immich_children_count += node.children.get_n_items()
-
-    print("\n" + "="*50)
-    print("DEBUG: BUILD_TREE STATISTIK")
-    print(f"Vom Parser übergebene Immich-Pfade: {immich_in_entries}")
-    print(f"Erstellte Immich-DarNodes im Speicher: {immich_nodes_created}")
-    print(f"Summe der Kinder-Elemente in allen Immich-Knoten: {immich_children_count}")
-    print(f"Wurzel-Knoten (Roots) in der GUI gesamt: {len(roots)}")
-    print("="*50 + "\n")
-
-    def sort_node(node):
-        children = [node.children.get_item(i) for i in range(node.children.get_n_items())]
-        children.sort(key=lambda n: (not n.is_dir, n.name.casefold()))
-        store = Gio.ListStore.new(DarNode)
-        for child in children:
-            sort_node(child)
-            store.append(child)
-        node.children = store
+    # Wenn die reine Python-Struktur steht, befüllen wir die GTK-Stores
+    def populate_gtk_children(node):
+        children_nodes = tree_structure.get(node.path, [])
+        if children_nodes:
+            children_nodes.sort(key=lambda n: (not n.is_dir, n.name.casefold()))
+            for child in children_nodes:
+                populate_gtk_children(child)
+                node.children.append(child)
 
     root_nodes = list(roots.values())
     root_nodes.sort(key=lambda n: (not n.is_dir, n.name.casefold()))
-    for node in root_nodes:
-        sort_node(node)
 
     root_store = Gio.ListStore.new(DarNode)
-    for node in root_nodes:
-        root_store.append(node)
+    for root_node in root_nodes:
+        populate_gtk_children(root_node)
+        root_store.append(root_node)
+
+    # REINES LOGGING ZUR KONTROLLE
+    print(f"DEBUG_FINAL: Wurzelknoten 'Immich' vorhanden? {'Immich' in roots}")
+    if 'Immich' in roots:
+        print(f"DEBUG_FINAL: Kinder im Wurzelknoten 'Immich': {roots['Immich'].children.get_n_items()}")
 
     return root_store, list(nodes.values())
 
@@ -371,6 +361,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         expander.set_list_row(row)
         node = row.get_item()
         expander.get_child().set_text(("📁  " if node.is_dir else "📄  ") + node.name)
+
     def load_archive(self, path):
         if self.loading or self.extracting:
             return
@@ -436,8 +427,21 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         return False
 
     @staticmethod
-    def _tree_children(item):
-        return item.children if item.is_dir else None
+    def _tree_children(*args):
+        if not args:
+            return None
+        # Das letzte Argument ist bei PyGObject immer das Ziel-Item
+        item = args[-1]
+
+        # Gtk.TreeListModel liefert hier oft ein Gtk.TreeListRow-Objekt.
+        # Wir müssen das echte DarNode-Objekt herausholen!
+        if hasattr(item, "get_item"):
+            item = item.get_item()
+
+        if item and hasattr(item, "is_dir") and item.is_dir:
+            return item.children
+        return None
+
 
     def on_tree_selection_changed(self, selection, _position, _n_items):
         row = selection.get_selected_item()
@@ -445,16 +449,32 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             return
 
         node = row.get_item()
+        if node is None:
+            return
+
         self.path_label.set_text(node.path)
 
         if self.search.get_text().strip():
             self._apply_search()
         else:
-            self.right_selection.set_model(
-                node.children if node.is_dir else Gio.ListStore.new(DarNode)
-            )
+            # KORREKTUR: Wir reichen den node.children Store IMMER direkt weiter.
+            # Ein leerer ListStore ist für GTK4 ein vollkommen gültiges Modell,
+            # solange wir kein neues, instanziiertes Alibi-Objekt erzwingen!
+            if hasattr(node, 'children') and node.children is not None:
+                self.right_selection.set_model(node.children)
+
+                total = node.children.get_n_items()
+                if total == 0:
+                    self.status_label.set_text("Dieser Ordner ist im Archiv leer.")
+                else:
+                    self.status_label.set_text(f"{total:,} Einträge in diesem Verzeichnis.".replace(",", "."))
+            else:
+                self.right_selection.set_model(Gio.ListStore.new(DarNode))
+                self.status_label.set_text("Dieser Ordner ist im Archiv leer.")
 
         self._update_extract_button()
+
+
 
     def on_right_selection_changed(self, _selection, _position, _n_items):
         self._update_extract_button()

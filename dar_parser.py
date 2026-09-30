@@ -33,7 +33,8 @@ def normalize_archive_argument(path: str) -> str:
 
 def run_dar_listing(path: str) -> tuple[list[ParsedEntry], str]:
     """
-    Führt DAR aus und parst die XML-Ausgabe inkrementell mit integriertem Logging.
+    Führt DAR aus und parst die XML-Ausgabe stabil via Streaming.
+    Verhindert Hierarchie-Konflikte bei doppelten XML-Knoten.
     """
     archive_arg = normalize_archive_argument(path)
 
@@ -42,7 +43,6 @@ def run_dar_listing(path: str) -> tuple[list[ParsedEntry], str]:
     env["LANG"] = "C"
 
     try:
-        # Wir lesen im Binärmodus, um iterparse direkt den Stream zu übergeben
         process = subprocess.Popen(
             ["dar", "-l", archive_arg, "-T", "xml", "-w"],
             stdout=subprocess.PIPE,
@@ -50,16 +50,12 @@ def run_dar_listing(path: str) -> tuple[list[ParsedEntry], str]:
             env=env,
         )
     except FileNotFoundError as exc:
-        raise RuntimeError(
-            "DAR wurde nicht gefunden. Bitte prüfen, ob `dar` im PATH liegt."
-        ) from exc
+        raise RuntimeError("DAR wurde nicht gefunden.")
     except OSError as exc:
-        raise RuntimeError(f"DAR konnte nicht gestartet werden: {exc}") from exc
+        raise RuntimeError(f"DAR Fehler: {exc}")
 
     entries: list[ParsedEntry] = []
-
-    # Der Stack speichert Tupel aus (XML-Element, "Name")
-    path_stack: list[tuple[ET.Element, str]] = []
+    path_stack: list[str] = []
 
     total_tags_seen = 0
     directory_tags_seen = 0
@@ -67,11 +63,9 @@ def run_dar_listing(path: str) -> tuple[list[ParsedEntry], str]:
     immich_matches_parsed = 0
 
     try:
-        # iterparse liest direkt aus dem binären stdout-Stream des Prozesses
         context = ET.iterparse(process.stdout, events=("start", "end"))
 
         for event, elem in context:
-            # Sichert die Erkennung unabhängig von der Groß-/Kleinschreibung des DAR-Tags
             tag = elem.tag.lower()
             name = elem.attrib.get("name", "").strip()
 
@@ -80,10 +74,7 @@ def run_dar_listing(path: str) -> tuple[list[ParsedEntry], str]:
 
                 if tag == "directory" and name:
                     directory_tags_seen += 1
-
-                    # Pfad aus dem Tupel-Stack (Index 1) korrekt extrahieren
-                    current_parts = [item[1] for item in path_stack] + [name]
-                    full_path = "/".join(current_parts)
+                    full_path = "/".join(path_stack + [name])
 
                     if "immich" in full_path.lower():
                         immich_matches_parsed += 1
@@ -99,13 +90,11 @@ def run_dar_listing(path: str) -> tuple[list[ParsedEntry], str]:
                             date=elem.attrib.get("date", "—"),
                         )
                     )
-                    path_stack.append((elem, name))
+                    path_stack.append(name)
 
                 elif tag == "file" and name:
                     file_tags_seen += 1
-
-                    current_parts = [item[1] for item in path_stack] + [name]
-                    file_path = "/".join(current_parts)
+                    file_path = "/".join(path_stack + [name])
 
                     if "immich" in file_path.lower():
                         immich_matches_parsed += 1
@@ -124,29 +113,34 @@ def run_dar_listing(path: str) -> tuple[list[ParsedEntry], str]:
 
             elif event == "end":
                 if tag == "directory" and name:
-                    # Sicherer Objektvergleich mit dem obersten Element des Stack-Tupels
-                    if path_stack and path_stack[-1][0] == elem:
+                    if path_stack and path_stack[-1] == name:
                         path_stack.pop()
-
-                # RAM freigeben
                 elem.clear()
 
     except ET.ParseError as err:
         process.terminate()
-        print(f"\n[CRITICAL] XML-Streaming abgebrochen bei Tag-Nummer {total_tags_seen}: {err}")
         raise RuntimeError(f"XML Parse Fehler: {err}")
-
-    # TERMINAL-LOGGING AUSGEBEN
-    print("\n" + "="*50)
-    print("DEBUG: DAR_PARSER STATISTIK")
-    print(f"Gesehene XML-Tags gesamt: {total_tags_seen}")
-    print(f"Gesehene Directory-Tags:  {directory_tags_seen}")
-    print(f"Gesehene File-Tags:       {file_tags_seen}")
-    print(f"Einträge mit 'Immich' im Pfad erfolgreich geparst: {immich_matches_parsed}")
-    print(f"Generierte ParsedEntry-Objekte gesamt: {len(entries)}")
-    print("="*50 + "\n")
 
     stderr_output = process.stderr.read().decode("utf-8", errors="replace")
     process.wait()
+
+    # REINES DEBUGGING: Wir gucken uns Stichproben aus der Masse an
+    print("\n--- PARSER STICHPROBE ---")
+    immich_entries = [e for e in entries if "immich" in e.path.lower()]
+    print(f"Gesamtanzahl Immich-Objekte in der Liste: {len(immich_entries)}")
+
+    # Die ersten 5 zeigen
+    print("Die ersten 5:")
+    for i, e in enumerate(immich_entries[:5]):
+        print(f"  [{i+1}] Pfad: '{e.path}' (Ordner? {e.is_dir})")
+
+    # Stichprobe aus der Mitte zeigen (falls vorhanden)
+    if len(immich_entries) > 500:
+        print("Stichprobe aus der Mitte (Index 500-510):")
+        for i, e in enumerate(immich_entries[500:510]):
+            print(f"  [500+{i}] Pfad: '{e.path}' (Ordner? {e.is_dir})")
+    print("-------------------------\n")
+
+
 
     return entries, stderr_output.strip()
