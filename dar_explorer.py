@@ -109,11 +109,21 @@ def build_tree(entries: list[ParsedEntry]):
 
     roots.sort(key=lambda n: (not n.is_dir, n.name.casefold()))
     root_store = Gio.ListStore.new(DarNode)
+
+    # KORREKTUR: Virtuellen Master-Knoten für das gesamte Archiv erstellen
+    archive_root = DarNode(
+        "📦 [Gesamtes Archiv entpacken]",
+        "",  # Ein absolut leerer Pfad symbolisiert die Wurzel
+        True, "drwxr-xr-x", "root", "root", "—", "—"
+    )
+
     for root_node in roots:
         populate_gtk_children(root_node)
-        root_store.append(root_node)
+        archive_root.children.append(root_node)
 
+    root_store.append(archive_root)
     return root_store, list(nodes.values())
+
 
 
 
@@ -444,7 +454,9 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         if node is None:
             return
 
-        self.path_label.set_text(node.path)
+        # KORREKTUR: Text für das virtuelle Element lesbar machen
+        self.path_label.set_text(node.path if node.path else "Gesamtes Archiv")
+
 
         if self.search.get_text().strip():
             self._apply_search()
@@ -477,7 +489,19 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             return
 
         n = self.right_selection.get_selection().get_size()
+
+        # KORREKTUR: Wenn der virtuelle Masterknoten links ausgewählt ist,
+        # schalten wir den Button direkt frei, auch wenn rechts nichts markiert wurde
+        sidebar_model = self.tree_selection.get_model()
+        sidebar_pos = self.tree_selection.get_selected()
+        if sidebar_pos != 0xffffffff and sidebar_model:
+            row = sidebar_model.get_item(sidebar_pos)
+            if row and row.get_item() and row.get_item().path == "":
+                self.extract_btn.set_sensitive(self.current_archive is not None)
+                return
+
         self.extract_btn.set_sensitive(n > 0 and self.current_archive is not None)
+
 
     def on_search_changed(self, _entry):
         self._apply_search()
@@ -544,15 +568,16 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
         # Falls in der rechten Tabelle nichts ausgewählt ist, prüfen wir den linken Baum
         if not paths_to_extract:
-            # Je nachdem, ob links SingleSelection oder MultiSelection aktiv ist,
-            # fragen wir die Selektion sicher ab:
             sidebar_selection = getattr(self, 'tree_selection', None)
             if sidebar_selection:
                 if hasattr(sidebar_selection, 'get_selected_item'):
                     row = sidebar_selection.get_selected_item()
-                    if row:
+                    if row and row.get_item():
                         node = row.get_item()
-                        if node:
+                        # KORREKTUR: Wenn leeres Array/String vorliegt -> Gesamtes Archiv markiert
+                        if node.path == "":
+                            paths_to_extract = [""]
+                        else:
                             paths_to_extract.append(node.path)
                 elif hasattr(sidebar_selection, 'get_selected'):
                     pos = sidebar_selection.get_selected()
@@ -675,8 +700,11 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         else:
             cmd.append("-O")
 
+        # KORREKTUR: Nur selektierte Unterpfade übergeben.
+        # Ist der Pfad [""], bleibt die Schleife stumm und es wird alles entpackt!
         for path in paths:
-            cmd.extend(["-g", path])
+            if path:
+                cmd.extend(["-g", path])
 
         env = os.environ.copy()
         env["LC_ALL"] = "C"
@@ -850,56 +878,12 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
 
 
-    def _prompt_for_slice_path_sync(self) -> str | None:
+    def _prompt_for_slice_path_sync(self, prompt_text: str) -> str | None:
         """
-        Öffnet einen synchronen Eingabedialog im GTK-Hauptthread
-        und blockiert den Worker-Thread, bis die Antwort vorliegt.
+        Nutzt den stabilen Queue-Kanal für Slice-Wechsel und isolierte Kataloge.
         """
-        condition = threading.Condition()
-        result_path = [None]
+        return self._prompt_user_interactive_queue(prompt_text)
 
-        def ask_user():
-            nonlocal result_path
-            with condition:
-                dialog = Gtk.Dialog(title="Echtes Datenarchiv benötigt", transient_for=self, modal=True)
-                dialog.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
-                dialog.add_button("Bestätigen", Gtk.ResponseType.OK)
-
-                box = dialog.get_content_area()
-                box.set_margin_all(12)
-                box.set_spacing(10)
-
-                label = Gtk.Label(
-                    label="DAR liest einen isolierten Katalog und benötigt nun die echten Daten.\n"
-                          "Bitte geben Sie den Basispfad (ohne .1.dar) zu den Archiv-Slices an:"
-                )
-                label.set_xalign(0)
-                box.append(label)
-
-                entry = Gtk.Entry()
-                entry.set_hexpand(True)
-                if self.current_archive:
-                    entry.set_text(self.current_archive)
-                box.append(entry)
-
-                def on_response(d, response_id):
-                    nonlocal result_path
-                    if response_id == Gtk.ResponseType.OK:
-                        result_path = entry.get_text()
-                    else:
-                        result_path = None
-                    d.destroy()
-                    with condition:
-                        condition.notify()
-
-                dialog.connect("response", on_response)
-                dialog.show()
-
-        with condition:
-            GLib.idle_add(ask_user)
-            condition.wait()
-
-        return result_path
 
     @staticmethod
     def _shell_quote(value):
