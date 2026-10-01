@@ -321,10 +321,12 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         f = self._label_factory()
         def bind(_, item):
             label = item.get_child()
-            label.set_xalign(1)
+            # KORREKTUR: Von 1 (rechts) auf 0 (links) setzen für Linksbündigkeit
+            label.set_xalign(0)
             label.set_text(item.get_item().size or "—")
         f.connect("bind", bind)
         return f
+
 
     def _date_factory(self):
         f = self._label_factory()
