@@ -657,18 +657,22 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         import pty
         import os
         import subprocess
+        import re
 
-        clean_archive = normalize_archive_argument(archive_arg) if 'normalize_archive_argument' in globals() else archive_arg
+        # KORREKTUR: Wir schneiden .X.dar am Ende des Pfads rigoros ab,
+        # damit DAR nur den echten Basisnamen ohne Slice-Nummer bekommt!
+        # Beispiel: "/pfad/dar-test.1.dar" -> "/pfad/dar-test"
+        clean_archive = archive_arg
+        if archive_arg.endswith(".dar"):
+            # Entfernt Muster wie .1.dar, .2.dar am Ende
+            clean_archive = re.sub(r"\.\d+\.dar$", "", archive_arg)
 
-        # Basis-Befehl bauen
+        # Basis-Befehl bauen mit dem bereinigten Basisnamen
         cmd = ["dar", "-x", clean_archive, "-R", destination, "-w"]
 
         if restore_ownership:
-            # KORREKTUR: Wenn die Rechte behalten werden sollen, MÜSSEN wir sudo nutzen,
-            # damit DAR die Berechtigungen schreiben darf und die Warnung entfällt!
             cmd = ["sudo"] + cmd
         else:
-            # Wenn Rechte egal sind, ignorieren wir sie explizit, um Prompts zu verhindern
             cmd.append("-O")
 
         for path in paths:
@@ -677,6 +681,9 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         env = os.environ.copy()
         env["LC_ALL"] = "C"
         env["LANG"] = "C"
+
+        # ... ab hier folgt Ihr restlicher, funktionierender PTY- und Schleifen-Code ...
+
 
         try:
             self._append_log_threadsafe("$ " + " ".join(self._shell_quote(x) for x in cmd))
