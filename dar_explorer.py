@@ -378,19 +378,33 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.path_label.set_text("DAR-Listing wird eingelesen …")
         self.status_label.set_text("DAR wird ausgeführt …")
 
+        # NEU: Fortschrittsbalken vorbereiten und sichtbar machen (Aktivitätsmodus)
+        self.progress.set_fraction(0.0)
+        self.progress.set_text("Analysiere Archivstruktur...")
+        self.progress.set_visible(True)
+
         threading.Thread(
             target=self._load_worker, args=(path,), daemon=True
         ).start()
 
+    # NEU: Hilfsmethode für den Worker-Thread, um die GUI zu aktualisieren
+    def _pulse_progress(self):
+        if self.loading:
+            self.progress.pulse()
+        return False  # Verhindert, dass GLib die Funktion mehrfach aufruft
+
+
     def _load_worker(self, path):
         try:
-            # Wir definieren eine kleine Brücke, die das GUI-Popup aufruft
             def password_callback(prompt_text):
-                # Nutzt unseren bereits existierenden, stabilen Queue-Dialog!
                 return self._prompt_user_interactive_queue(prompt_text)
 
-            # KORREKTUR: Wir übergeben die Brücke an den Parser
-            entries, warning = run_dar_listing(path, password_callback)
+            # NEU: Ein zweites Callback, das GLib.idle_add nutzt, um den Balken zu bewegen
+            def progress_bridge():
+                GLib.idle_add(self._pulse_progress)
+
+            # KORREKTUR: Beide Callbacks an den Parser übergeben
+            entries, warning = run_dar_listing(path, password_callback, progress_bridge)
             GLib.idle_add(self._load_finished, path, entries, warning, None)
         except Exception as exc:
             GLib.idle_add(self._load_finished, path, None, "", str(exc))
@@ -399,6 +413,11 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
     def _load_finished(self, path, entries, warning, error):
         self.loading = False
         self.reload_btn.set_sensitive(True)
+
+        # NEU: Fortschrittsbalken nach dem Laden wieder ausblenden
+        self.progress.set_visible(False)
+        self.progress.set_fraction(0.0)
+        self.progress.set_text("")
 
         if error:
             self.status_label.set_text("Fehler beim Einlesen")

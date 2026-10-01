@@ -62,17 +62,18 @@ def format_date(timestamp_str: str) -> str:
     except (ValueError, TypeError):
         return timestamp_str
 
-def run_dar_listing(path: str, password_callback=None) -> tuple[list[ParsedEntry], str]:
+def run_dar_listing(path: str, password_callback=None, progress_callback=None) -> tuple[list[ParsedEntry], str]:
     import pty
     import os
     import io
+    import xml.etree.ElementTree as ET
 
     archive_arg = normalize_archive_argument(path)
     env = os.environ.copy()
     env["LC_ALL"] = "C"
     env["LANG"] = "C"
 
-    # Wir nutzen ein PTY (Pseudo-Terminal), damit DAR die Passwort-Eingabe akzeptiert
+    # Wir nutzen das PTY NUR für den Start (Passwort-Erkennung)
     master_fd, slave_fd = pty.openpty()
 
     try:
@@ -89,16 +90,21 @@ def run_dar_listing(path: str, password_callback=None) -> tuple[list[ParsedEntry
     except OSError as exc:
         raise RuntimeError(f"DAR konnte nicht gestartet werden: {exc}") from exc
 
+    # Den Slave-Teil im Hauptprozess sofort schließen
     os.close(slave_fd)
 
     entries: list[ParsedEntry] = []
     path_stack: list[str] = []
-    xml_accumulator = []
+
+    # BytesIO-Speicherpuffer für das XML (schont RAM im Vergleich zu einer Riesen-Liste aus Einzelbytes)
+    xml_stream = io.BytesIO()
 
     buffer = ""
     parsing_started = False
+    char_counter = 0
 
-    while True:
+    # PHASE 1: Zeichenweise lesen, bis das XML beginnt (wichtig für Passwort-Abfrage)
+    while not parsing_started:
         try:
             char_bytes = os.read(master_fd, 1)
         except OSError:
@@ -107,47 +113,67 @@ def run_dar_listing(path: str, password_callback=None) -> tuple[list[ParsedEntry
             break
 
         char = char_bytes.decode("utf-8", errors="replace")
+        buffer += char
 
-        if not parsing_started:
-            buffer += char
-            # Prüfen, ob eine Zeile abgeschlossen ist
-            if char == "\n":
-                # Wenn es normaler Text vor dem XML ist (z.B. die Warnung), sammeln wir ihn nicht fürs XML
-                buffer = ""
-            else:
-                clean_buf = buffer.strip()
-                # ERKENNUNG DER PASSWORT-ABFRAGE
-                if clean_buf.endswith("requires a password:"):
-                    if password_callback:
-                        # Popup in der GUI triggern
-                        password = password_callback(buffer)
-                        if password is not None:
-                            os.write(master_fd, (password + "\n").encode("utf-8"))
-                        else:
-                            process.terminate()
-                            raise RuntimeError("Archiv-Einlesen vom Benutzer abgebrochen (kein Passwort angegeben).")
-                    buffer = ""
-
-                # Sobald das erste XML-Zeichen auftaucht, schalten wir um
-                elif "<" in buffer:
-                    parsing_started = True
-                    # Den bisherigen Inhalt des Puffers (das '<' und evtl. Reste) fürs XML retten
-                    xml_accumulator.append(buffer.encode("utf-8"))
-                    buffer = ""
+        if char == "\n":
+            buffer = ""
         else:
-            # Wenn wir im XML-Modus sind, sammeln wir die Bytes direkt für den Parser
-            xml_accumulator.append(char_bytes)
+            clean_buf = buffer.strip()
+            if clean_buf.endswith("requires a password:"):
+                if password_callback:
+                    password = password_callback(buffer)
+                    if password is not None:
+                        os.write(master_fd, (password + "\n").encode("utf-8"))
+                    else:
+                        process.terminate()
+                        raise RuntimeError("Archiv-Einlesen vom Benutzer abgebrochen.")
+                buffer = ""
 
-    # Den gesammelten XML-Stream im Speicher als Datei-ähnliches Objekt aufbereiten
-    xml_data = b"".join(xml_accumulator)
+            elif "<" in buffer:
+                # Das XML-Signal wurde erkannt!
+                parsing_started = True
+                # Die bisher aufgelaufenen Zeichen (inklusive des '<') ins XML schreiben
+                xml_stream.write(buffer.encode("utf-8"))
+                break
+
+    # PHASE 2: Effizientes Block-Lesen für gigantische XML-Datenströme
+    # Verhindert das Überlaufen des PTYs und den Shell-Absturz vollkommen!
+    if parsing_started:
+        while True:
+            try:
+                # 64 KB Blöcke statt 1 Byte! Das beschleunigt den Vorgang um den Faktor 1000+
+                chunk = os.read(master_fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+
+            xml_stream.write(chunk)
+
+            # Den Fortschrittsbalken in der GUI alle paar Blöcke updaten
+            if progress_callback:
+                char_counter += len(chunk)
+                if char_counter >= 500000:  # Ca. alle 500 KB ein Lebenszeichen
+                    progress_callback()
+                    char_counter = 0
+
+    # Master-Dateideskriptor sauber schließen
+    try:
+        os.close(master_fd)
+    except OSError:
+        pass
+
+    process.wait()
+
+    # XML-Daten bereitstellen
+    xml_data = xml_stream.getvalue()
+    xml_stream.close()
 
     if not xml_data:
-        process.wait()
-        raise RuntimeError("Es wurden keine XML-Daten von DAR empfangen. Falsches Passwort?")
+        raise RuntimeError("Es wurden keine XML-Daten von DAR empfangen. Eventuell falsches Passwort oder beschädigtes Archiv?")
 
-    # Nun jagen wir die sauberen XML-Daten durch den bewährten ElementTree-Parser
+    # PHASE 3: Inkrementelles XML-Parsing
     try:
-        # Inkrementelles XML-Parsing aus dem Speicher-Stream
         context = ET.iterparse(io.BytesIO(xml_data), events=("start", "end"))
         for event, elem in context:
             tag = elem.tag.capitalize()
@@ -174,11 +200,9 @@ def run_dar_listing(path: str, password_callback=None) -> tuple[list[ParsedEntry
             elif event == "end":
                 if tag == "Directory" and name and path_stack and path_stack[-1] == name:
                     path_stack.pop()
-                elem.clear()
+                elem.clear()  # Wichtig: Löscht gelesene Elemente aus dem RAM!
 
     except ET.ParseError as err:
-        process.terminate()
         raise RuntimeError(f"XML Struktur-Fehler beim Laden: {err}. Eventuell falsches Passwort?") from err
 
-    process.wait()
     return entries, ""
