@@ -716,32 +716,44 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
     def _start_extraction_thread(self, destination, paths_to_extract, restore_ownership):
         """UI sperren und den Hintergrund-Worker starten."""
-        self.progress.set_fraction(0.0)
+        self.extracting = True
+        self.extract_btn.set_sensitive(False)
+        self.reload_btn.set_sensitive(False)
 
-        # Thread starten und die Pfad-Liste direkt mitgeben
+        # NEU: Gesamtzahl der zu entpackenden Dateien im RAM berechnen
+        if paths_to_extract == [""]:
+            total_expected_files = len(self.all_nodes)
+        else:
+            total_expected_files = sum(
+                1 for node in self.all_nodes
+                if any(node.path.startswith(p) for p in paths_to_extract if p)
+            )
+        total_expected_files = max(1, total_expected_files)
+
+        self.progress.set_fraction(0.0)
+        self.progress.set_text("Extraktion wird gestartet... 0%")
+        self.progress.set_visible(True)
+
+        # Thread starten und total_expected_files als neuen Parameter übergeben
         t = threading.Thread(
             target=self._extract_worker,
-            args=(self.current_archive, paths_to_extract, destination, restore_ownership),
+            args=(self.current_archive, paths_to_extract, destination, restore_ownership, total_expected_files),
             daemon=True
         )
         t.start()
 
 
-    def _extract_worker(self, archive_arg, paths, destination, restore_ownership):
+
+    def _extract_worker(self, archive_arg, paths, destination, restore_ownership, total_expected_files):
         import pty
         import os
         import subprocess
         import re
 
-        # KORREKTUR: Wir schneiden .X.dar am Ende des Pfads rigoros ab,
-        # damit DAR nur den echten Basisnamen ohne Slice-Nummer bekommt!
-        # Beispiel: "/pfad/dar-test.1.dar" -> "/pfad/dar-test"
         clean_archive = archive_arg
         if archive_arg.endswith(".dar"):
-            # Entfernt Muster wie .1.dar, .2.dar am Ende
             clean_archive = re.sub(r"\.\d+\.dar$", "", archive_arg)
 
-        # Basis-Befehl bauen mit dem bereinigten Basisnamen
         cmd = ["dar", "-x", clean_archive, "-R", destination, "-w"]
 
         if restore_ownership:
@@ -749,8 +761,10 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         else:
             cmd.append("-O")
 
-        # KORREKTUR: Nur selektierte Unterpfade übergeben.
-        # Ist der Pfad [""], bleibt die Schleife stumm und es wird alles entpackt!
+        # Das gemerkte Passwort nutzen, falls vorhanden (wird später wichtig)
+        if hasattr(self, 'archive_password') and self.archive_password:
+            cmd.extend(["-K", self.archive_password])
+
         for path in paths:
             if path:
                 cmd.extend(["-g", path])
@@ -758,9 +772,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         env = os.environ.copy()
         env["LC_ALL"] = "C"
         env["LANG"] = "C"
-
-        # ... ab hier folgt Ihr restlicher, funktionierender PTY- und Schleifen-Code ...
-
 
         try:
             self._append_log_threadsafe("$ " + " ".join(self._shell_quote(x) for x in cmd))
@@ -779,6 +790,16 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             os.close(slave_fd)
 
             buffer = ""
+            extracted_count = 0  # NEU: Zähler für entpackte Dateien
+
+            # Eine kleine thread-sichere Brücke zur UI-Aktualisierung
+            def update_extraction_ui(current_fraction, current_text, log_line=None):
+                self.progress.set_fraction(current_fraction)
+                self.progress.set_text(current_text)
+                if log_line:
+                    self._append_log(log_line)
+                return False
+
             while True:
                 try:
                     char_bytes = os.read(master_fd, 1)
@@ -793,23 +814,27 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
                 if char == "\n":
                     line_to_log = buffer.rstrip()
-                    GLib.idle_add(self._append_log, line_to_log)
-                    GLib.idle_add(self.progress.pulse)
                     buffer = ""
 
+                    if line_to_log:
+                        # NEU: Jede nicht-leere Zeile erhöht den Fortschritt
+                        extracted_count += 1
+
+                        # Prozentwert berechnen (skaliert von 0.0 bis 1.0)
+                        fraction = min(1.0, extracted_count / total_expected_files)
+                        percentage = int(fraction * 100)
+
+                        text = f"Entpacke Dateien... {percentage}% ({extracted_count:,} von {total_expected_files:,})".replace(",", ".")
+                        GLib.idle_add(update_extraction_ui, fraction, text, line_to_log)
+
                 else:
-                    # KORREKTUR: Wir entfernen führende/folgende Leerzeichen vor der Prüfung,
-                    # damit "password for burda: " zuverlässig auf ":" endet!
                     clean_buffer = buffer.strip()
 
                     if clean_buffer.endswith("]") or clean_buffer.endswith(":") or clean_buffer.endswith("?"):
                         lower_buf = clean_buffer.lower()
 
                         if any(x in lower_buf for x in ["password", "slice", "path", "enter", "privilege"]):
-                            # NEU: Das Log-Fenster sofort automatisch aufklappen!
                             GLib.idle_add(self._force_show_log)
-
-                            # Die unvollständige Zeile vor dem Dialog im GUI-Log anzeigen
                             GLib.idle_add(self._append_log, f"[GUI-Prompt]: {clean_buffer}")
 
                             user_response = self._prompt_user_interactive_queue(buffer)
@@ -821,7 +846,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                                 process.terminate()
                                 break
                             buffer = ""
-
 
             if buffer:
                 GLib.idle_add(self._append_log, buffer.rstrip())
@@ -836,6 +860,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
         except Exception as exc:
             GLib.idle_add(self._extract_finished, -1, destination, str(exc))
+
 
 
 
