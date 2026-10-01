@@ -525,6 +525,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
     def on_reload_clicked(self, _button):
         if self.current_archive:
             self.load_archive(self.current_archive)
+
     def on_extract_clicked(self, _button):
         selected = self._selected_nodes()
         if not selected:
@@ -588,68 +589,70 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         ).start()
 
     def _extract_worker(self, archive_arg, paths, destination):
-        cmd = ["dar", "-x", archive_arg, "-R", destination]
+        # KORREKTUR: Wir nutzen hier ebenfalls normalize_archive_argument,
+        # damit DAR den sauberen Basisnamen ohne ".1.dar" übergeben bekommt!
+        clean_archive = self.normalize_archive_argument(archive_arg) if hasattr(self, 'normalize_archive_argument') else archive_arg
+
+        # Falls die Methode in dar_parser.py liegt und importiert wurde, nutzen wir sie direkt:
+        # clean_archive = normalize_archive_argument(archive_arg)
+
+        cmd = ["dar", "-x", clean_archive, "-R", destination, "-O", "-w"]
 
         for path in paths:
             cmd.extend(["-g", path])
 
-        env = os.environ.copy()
-        env["LC_ALL"] = "C"
-        env["LANG"] = "C"
 
         try:
             self._append_log_threadsafe("$ " + " ".join(self._shell_quote(x) for x in cmd))
 
-            # Pipe für stdin hinzufügen, um interaktiv antworten zu können
+            # KORREKTUR: text=True wird ENTFERNT, bufsize=0 zwingt zu absolut ungepuffertem Binär-Streaming
             process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=env,
                 bufsize=0,
+                env=env,
             )
 
             buffer = ""
             while True:
-                char = process.stdout.read(1)
-                if not char:
+                # KORREKTUR: Wir lesen 1 rohes Byte aus dem Stream
+                char_bytes = process.stdout.read(1)
+                if not char_bytes:
                     break
 
+                # Byte direkt in Text übersetzen
+                char = char_bytes.decode("utf-8", errors="replace")
                 buffer += char
 
+                # Normale Zeilen loggen
                 if char == "\n":
                     line_to_log = buffer.rstrip()
                     GLib.idle_add(self._append_log, line_to_log)
                     GLib.idle_add(self.progress.pulse)
                     buffer = ""
 
-                # SZNARIO 1: Fehlende Privilegien für Datei-Besitzer (Automatisch bestätigen)
-                elif "lack of privilege" in buffer.lower() or "[return = yes" in buffer.lower():
-                    GLib.idle_add(self._append_log, buffer + " [GUI: Automatisch mit JA beantwortet]")
-                    # Sende ein einfaches Enter (\n), um das standardmäßige "YES" zu triggern
-                    process.stdin.write("\n")
-                    process.stdin.flush()
-                    buffer = ""
+                # ERKENNUNG VON INTERAKTION (Wenn der Puffer auf ein Prompt-Zeichen endet)
+                elif buffer.endswith("]") or buffer.endswith(":") or buffer.endswith("?"):
+                    lower_buf = buffer.lower()
 
-                # SZENARIO 2: Isoliertes Archiv fordert echtes Daten-Slice nach (GUI-Dialog öffnen)
-                elif "or enter the path to slice" in buffer.lower() or "clic to continue" in buffer.lower():
-                    GLib.idle_add(self._append_log, buffer)
+                    # Nur reagieren, wenn es sich um bekannte DAR-Abfragen handelt
+                    if any(x in lower_buf for x in ["path", "password", "continue", "lack of privilege", "[return", "enter"]):
+                        GLib.idle_add(self._append_log, f"[GUI-Prompt]: {buffer}")
 
-                    requested_path = self._prompt_for_slice_path_sync()
+                        # Unser schönes neues Dialog-Fenster aufrufen
+                        user_response = self._prompt_user_interactive_sync(buffer)
 
-                    if requested_path:
-                        clean_path = normalize_archive_argument(requested_path)
-                        process.stdin.write(clean_path + "\n")
-                        process.stdin.flush()
-                    else:
-                        process.terminate()
-                        break
-                    buffer = ""
-
+                        if user_response is not None:
+                            # KORREKTUR: Antwort als Binärdaten (.encode()) mit Zeilenumbruch an DAR senden
+                            response_bytes = (user_response + "\n").encode("utf-8")
+                            process.stdin.write(response_bytes)
+                            process.stdin.flush()
+                        else:
+                            process.terminate()
+                            break
+                        buffer = ""
 
             if buffer:
                 GLib.idle_add(self._append_log, buffer.rstrip())
@@ -659,6 +662,105 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
         except Exception as exc:
             GLib.idle_add(self._extract_finished, -1, destination, str(exc))
+
+
+    def _prompt_user_interactive_sync(self, prompt_text: str) -> str | None:
+        """
+        Öffnet einen flexiblen, synchronen Dialog im GTK4-Hauptthread über ein Gtk.Window.
+        Blockiert den Worker-Thread sicher, bis der Benutzer antwortet.
+        """
+        condition = threading.Condition()
+        user_input_container = [None]
+
+        def ask_user():
+            with condition:
+                # KORREKTUR: Reines Gtk.Window statt veraltetem Gtk.Dialog nutzen
+                window = Gtk.Window(title="DAR Interaktion benötigt", transient_for=self, modal=True)
+                window.set_default_size(400, -1)
+
+                # Haupt-Layout
+                main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+                main_box.set_margin_top(15)
+                main_box.set_margin_bottom(15)
+                main_box.set_margin_start(15)
+                main_box.set_margin_end(15)
+                window.set_child(main_box)
+
+                # Textanzeige der Frage
+                label = Gtk.Label(label=prompt_text.strip())
+                label.set_xalign(0)
+                label.set_wrap(True)
+                main_box.append(label)
+
+                # Eingabefeld (nur für Passwörter oder Slices)
+                entry = Gtk.Entry()
+                entry.set_hexpand(True)
+
+                is_yes_no = "[return = yes" in prompt_text.lower() or "esc = no" in prompt_text.lower()
+
+                if "password" in prompt_text.lower():
+                    entry.set_visibility(False)
+                if "slice" in prompt_text.lower() and self.current_archive:
+                    entry.set_text(self.current_archive)
+
+                if not is_yes_no:
+                    main_box.append(entry)
+
+                # Button-Leiste unten
+                button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+                button_box.set_halign(Gtk.Align.END)
+                main_box.append(button_box)
+
+                # Buttons erstellen
+                btn_cancel = Gtk.Button(label="Abbrechen")
+                button_box.append(btn_cancel)
+
+                if is_yes_no:
+                    btn_no = Gtk.Button(label="Nein (ESC)")
+                    btn_yes = Gtk.Button(label="Ja (Enter)")
+                    button_box.append(btn_no)
+                    button_box.append(btn_yes)
+                else:
+                    btn_ok = Gtk.Button(label="Bestätigen")
+                    button_box.append(btn_ok)
+
+                # Signal-Handler für die Buttons (Direkte Freigabe des Threads)
+                def finalize(result_value):
+                    user_input_container[0] = result_value
+                    window.close()  # Schließt das Fenster sauber in GTK4
+
+                btn_cancel.connect("clicked", lambda _: finalize(None))
+                if is_yes_no:
+                    btn_no.connect("clicked", lambda _: finalize("no"))
+                    btn_yes.connect("clicked", lambda _: finalize(""))
+                else:
+                    btn_ok.connect("clicked", lambda _: finalize(entry.get_text()))
+
+                # Fallback, wenn der Benutzer das Fenster über das 'X' schließt
+                def on_close_request(_):
+                    with condition:
+                        condition.notify()
+                    return False
+
+                window.connect("close-request", on_close_request)
+
+                # Zerstörungs-Signal nutzen, um den wartenden Thread aufzuwecken
+                def on_destroy(_):
+                    with condition:
+                        condition.notify()
+
+                window.connect("destroy", on_destroy)
+                window.present()
+
+        with condition:
+            GLib.idle_add(ask_user)
+            condition.wait()
+
+        # Gibt den exakten Wert an den Worker zurück
+        return user_input_container[0]
+
+
+
 
     def _prompt_for_slice_path_sync(self) -> str | None:
         """
