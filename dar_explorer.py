@@ -745,7 +745,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         cmd = ["dar", "-x", clean_archive, "-R", destination, "-w"]
 
         if restore_ownership:
-            cmd = ["sudo"] + cmd
+            cmd = ["sudo", "-S"] + cmd
         else:
             cmd.append("-O")
 
@@ -806,6 +806,9 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                         lower_buf = clean_buffer.lower()
 
                         if any(x in lower_buf for x in ["password", "slice", "path", "enter", "privilege"]):
+                            # NEU: Das Log-Fenster sofort automatisch aufklappen!
+                            GLib.idle_add(self._force_show_log)
+
                             # Die unvollständige Zeile vor dem Dialog im GUI-Log anzeigen
                             GLib.idle_add(self._append_log, f"[GUI-Prompt]: {clean_buffer}")
 
@@ -986,6 +989,13 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
     def on_show_log_toggled(self, button):
         self.log_frame.set_visible(button.get_active())
+
+    def _force_show_log(self):
+        """Klappt die DAR-Ausgabe im GUI automatisch auf, falls sie geschlossen war."""
+        if not self.show_log_btn.get_active():
+            self.show_log_btn.set_active(True)
+        return False
+
 
     def _show_error(self, title, message):
         dialog = Gtk.AlertDialog()
