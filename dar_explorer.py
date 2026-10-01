@@ -178,18 +178,32 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.archive_label.set_xalign(0)
         self.archive_label.add_css_class("dim-label")
 
+        # NEU: Das dauerhafte Label für die Gesamtstatistik oben rechts erstellen
+        self.total_stats_label = Gtk.Label(label="")
+        self.total_stats_label.set_xalign(1)  # Rechtsbündig ausrichten
+        self.total_stats_label.add_css_class("dim-label")
+
         self.path_label = Gtk.Label(label="")
         self.path_label.set_xalign(0)
         self.path_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
         self.path_label.add_css_class("path-label")
 
-        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        # Die Pfad-Infos kommen in eine interne vertikale Box auf die linke Seite
+        left_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        left_info.set_hexpand(True)  # Dehnt sich aus, um das Statistik-Label nach rechts zu schieben
+        left_info.append(self.archive_label)
+        left_info.append(self.path_label)
+
+        # Das Haupt-Infoband unter der Headerbar wird HORIZONTAL
+        info = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         info.set_margin_top(8)
         info.set_margin_bottom(6)
         info.set_margin_start(10)
         info.set_margin_end(10)
-        info.append(self.archive_label)
-        info.append(self.path_label)
+
+        info.append(left_info)
+        info.append(self.total_stats_label)  # Das Statistik-Label sitzt jetzt permanent ganz rechts
+
 
         self.tree_selection = Gtk.SingleSelection()
         self.tree_selection.set_autoselect(True)
@@ -502,8 +516,14 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         if warning:
             msg += f"  •  {warning.splitlines()}"
 
+        # Unten in der Statuszeile wird es wie gewohnt eingetragen
         self.status_label.set_text(msg)
+
+        # NEU: Genau dieselbe wertvolle Info schreiben wir jetzt fest oben rechts rein!
+        self.total_stats_label.set_text(msg)
+
         self.path_label.set_text("Archivwurzel")
+
 
         if self.root_store.get_n_items():
             self.tree_selection.set_selected(0)
