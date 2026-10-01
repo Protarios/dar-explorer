@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import threading
+import queue
 from pathlib import Path
 
 import gi
@@ -527,135 +528,221 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             self.load_archive(self.current_archive)
 
     def on_extract_clicked(self, _button):
-        selected = self._selected_nodes()
-        if not selected:
-            return
+        paths_to_extract = []
 
-        dialog = Gtk.FileDialog()
-        dialog.set_title("Zielverzeichnis für die Extraktion auswählen")
-        dialog.select_folder(self, None, self._extract_folder_done, selected)
-
-    def _extract_folder_done(self, dialog, result, selected):
-        try:
-            folder = dialog.select_folder_finish(result)
-        except GLib.Error:
-            return
-
-        if folder is None:
-            return
-
-        destination = folder.get_path()
-        if destination:
-            self._start_extraction(selected, destination)
-
-    def _selected_nodes(self):
+        # Zugriff auf die Gtk.MultiSelection für die rechte Tabelle
+        selection_bitset = self.right_selection.get_selection()
         model = self.right_selection.get_model()
-        selection = self.right_selection.get_selection()
-        result = []
 
-        if model is None:
-            return result
+        if selection_bitset and model and not selection_bitset.is_empty():
+            # Wir gehen alle Indizes durch, die im Bitset als ausgewählt markiert sind
+            for i in range(model.get_n_items()):
+                if selection_bitset.contains(i):
+                    item = model.get_item(i)
+                    if item:
+                        paths_to_extract.append(item.path)
 
-        for i in range(model.get_n_items()):
-            if selection.contains(i):
-                result.append(model.get_item(i))
+        # Falls in der rechten Tabelle nichts ausgewählt ist, prüfen wir den linken Baum
+        if not paths_to_extract:
+            # Je nachdem, ob links SingleSelection oder MultiSelection aktiv ist,
+            # fragen wir die Selektion sicher ab:
+            sidebar_selection = getattr(self, 'tree_selection', None)
+            if sidebar_selection:
+                if hasattr(sidebar_selection, 'get_selected_item'):
+                    row = sidebar_selection.get_selected_item()
+                    if row:
+                        node = row.get_item()
+                        if node:
+                            paths_to_extract.append(node.path)
+                elif hasattr(sidebar_selection, 'get_selected'):
+                    pos = sidebar_selection.get_selected()
+                    if pos != 0xffffffff and (pos >> 32 == 0):
+                        sidebar_model = sidebar_selection.get_model()
+                        if sidebar_model:
+                            row = sidebar_model.get_item(pos)
+                            if row:
+                                node = row.get_item()
+                                if node:
+                                    paths_to_extract.append(node.path)
 
-        return result
-
-    def _start_extraction(self, nodes, destination):
-        if not self.current_archive or self.extracting:
+        if not paths_to_extract:
+            self._append_log_threadsafe("Keine Dateien zur Extraktion ausgewählt.")
             return
 
-        self.extracting = True
-        self.extract_btn.set_sensitive(False)
-        self.reload_btn.set_sensitive(False)
+        # 2. Zielverzeichnis abfragen
+        dialog = Gtk.FileDialog(title="Extraktions-Ziel wählen")
 
-        self.progress.set_visible(True)
-        self.progress.set_fraction(0.0)
-        self.progress.set_text("Extraktion wird vorbereitet …")
+        def on_folder_picked(dialog_obj, result):
+            try:
+                folder = dialog_obj.select_folder_finish(result)
+                if folder:
+                    destination = folder.get_path()
+                    self._ask_for_permissions_mode(destination, paths_to_extract)
+            except Exception as e:
+                self._append_log_threadsafe(f"Fehler bei der Ordnerauswahl: {e}")
 
-        self._clear_log()
-        self.status_label.set_text(
-            f"{len(nodes)} Einträge werden nach {destination} extrahiert …"
+        dialog.select_folder(self, None, on_folder_picked)
+
+
+    def _ask_for_permissions_mode(self, destination, paths_to_extract):
+        """Öffnet ein sauberes GTK4-Fenster zur Auswahl des Berechtigungs-Modus."""
+        # KORREKTUR: Reines Gtk.Window statt veraltetem Gtk.Dialog nutzen, um Warnung zu eliminieren
+        window = Gtk.Window(title="Berechtigungen wiederherstellen?", transient_for=self, modal=True)
+        window.set_default_size(450, -1)
+
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        main_box.set_margin_top(15)
+        main_box.set_margin_bottom(15)
+        main_box.set_margin_start(15)
+        main_box.set_margin_end(15)
+        window.set_child(main_box)
+
+        label = Gtk.Label()
+        label.set_markup(
+            "<b>Wie sollen Dateiberechtigungen (Besitzer/Gruppen) wiederhergestellt werden?</b>\n\n"
+            "• <i>Originale Rechte behalten:</i> DAR stellt UID/GID exakt wieder her. Das Programm "
+            "fordert hierzu gleich Ihr sudo-Passwort über ein Popup an.\n"
+            "• <i>Rechte ignorieren:</i> Alle Dateien gehören danach Ihrem aktuellen Benutzer (sicher für normale Daten)."
         )
+        label.set_xalign(0)
+        label.set_wrap(True)
+        main_box.append(label)
 
-        archive_arg = normalize_archive_argument(self.current_archive)
-        paths = [node.path for node in nodes]
+        # Button-Leiste unten anordnen
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        button_box.set_halign(Gtk.Align.END)
+        main_box.append(button_box)
 
-        threading.Thread(
+        # Einzelne Buttons erstellen
+        btn_cancel = Gtk.Button(label="Abbrechen")
+        btn_ignore = Gtk.Button(label="Rechte ignorieren")
+        btn_keep = Gtk.Button(label="Originale Rechte behalten")
+
+        button_box.append(btn_cancel)
+        button_box.append(btn_ignore)
+        button_box.append(btn_keep)
+
+        # Zentrale Antwort-Aktion
+        def on_choice_made(button, action_type):
+            window.close()
+            if action_type == "cancel":
+                return
+
+            restore_ownership = (action_type == "keep")
+            # Extraktions-Thread mit der getroffenen Entscheidung starten
+            self._start_extraction_thread(destination, paths_to_extract, restore_ownership)
+
+        # Event-Handler absolut verwechslungssicher verbinden
+        btn_cancel.connect("clicked", on_choice_made, "cancel")
+        btn_ignore.connect("clicked", on_choice_made, "ignore")
+        btn_keep.connect("clicked", on_choice_made, "keep")
+
+        window.present()
+
+
+    def _start_extraction_thread(self, destination, paths_to_extract, restore_ownership):
+        """UI sperren und den Hintergrund-Worker starten."""
+        self.progress.set_fraction(0.0)
+
+        # Thread starten und die Pfad-Liste direkt mitgeben
+        t = threading.Thread(
             target=self._extract_worker,
-            args=(archive_arg, paths, destination),
-            daemon=True,
-        ).start()
+            args=(self.current_archive, paths_to_extract, destination, restore_ownership),
+            daemon=True
+        )
+        t.start()
 
-    def _extract_worker(self, archive_arg, paths, destination):
-        # KORREKTUR: Wir nutzen hier ebenfalls normalize_archive_argument,
-        # damit DAR den sauberen Basisnamen ohne ".1.dar" übergeben bekommt!
-        clean_archive = self.normalize_archive_argument(archive_arg) if hasattr(self, 'normalize_archive_argument') else archive_arg
 
-        # Falls die Methode in dar_parser.py liegt und importiert wurde, nutzen wir sie direkt:
-        # clean_archive = normalize_archive_argument(archive_arg)
+    def _extract_worker(self, archive_arg, paths, destination, restore_ownership):
+        import pty
+        import os
+        import subprocess
 
-        cmd = ["dar", "-x", clean_archive, "-R", destination, "-O", "-w"]
+        clean_archive = normalize_archive_argument(archive_arg) if 'normalize_archive_argument' in globals() else archive_arg
+
+        # Basis-Befehl bauen
+        cmd = ["dar", "-x", clean_archive, "-R", destination, "-w"]
+
+        if restore_ownership:
+            # KORREKTUR: Wenn die Rechte behalten werden sollen, MÜSSEN wir sudo nutzen,
+            # damit DAR die Berechtigungen schreiben darf und die Warnung entfällt!
+            cmd = ["sudo"] + cmd
+        else:
+            # Wenn Rechte egal sind, ignorieren wir sie explizit, um Prompts zu verhindern
+            cmd.append("-O")
 
         for path in paths:
             cmd.extend(["-g", path])
 
+        env = os.environ.copy()
+        env["LC_ALL"] = "C"
+        env["LANG"] = "C"
 
         try:
             self._append_log_threadsafe("$ " + " ".join(self._shell_quote(x) for x in cmd))
 
-            # KORREKTUR: text=True wird ENTFERNT, bufsize=0 zwingt zu absolut ungepuffertem Binär-Streaming
+            master_fd, slave_fd = pty.openpty()
+
             process = subprocess.Popen(
                 cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=0,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                close_fds=True,
                 env=env,
             )
 
+            os.close(slave_fd)
+
             buffer = ""
             while True:
-                # KORREKTUR: Wir lesen 1 rohes Byte aus dem Stream
-                char_bytes = process.stdout.read(1)
+                try:
+                    char_bytes = os.read(master_fd, 1)
+                except OSError:
+                    break
+
                 if not char_bytes:
                     break
 
-                # Byte direkt in Text übersetzen
                 char = char_bytes.decode("utf-8", errors="replace")
                 buffer += char
 
-                # Normale Zeilen loggen
                 if char == "\n":
                     line_to_log = buffer.rstrip()
                     GLib.idle_add(self._append_log, line_to_log)
                     GLib.idle_add(self.progress.pulse)
                     buffer = ""
 
-                # ERKENNUNG VON INTERAKTION (Wenn der Puffer auf ein Prompt-Zeichen endet)
-                elif buffer.endswith("]") or buffer.endswith(":") or buffer.endswith("?"):
-                    lower_buf = buffer.lower()
+                else:
+                    # KORREKTUR: Wir entfernen führende/folgende Leerzeichen vor der Prüfung,
+                    # damit "password for burda: " zuverlässig auf ":" endet!
+                    clean_buffer = buffer.strip()
 
-                    # Nur reagieren, wenn es sich um bekannte DAR-Abfragen handelt
-                    if any(x in lower_buf for x in ["path", "password", "continue", "lack of privilege", "[return", "enter"]):
-                        GLib.idle_add(self._append_log, f"[GUI-Prompt]: {buffer}")
+                    if clean_buffer.endswith("]") or clean_buffer.endswith(":") or clean_buffer.endswith("?"):
+                        lower_buf = clean_buffer.lower()
 
-                        # Unser schönes neues Dialog-Fenster aufrufen
-                        user_response = self._prompt_user_interactive_sync(buffer)
+                        if any(x in lower_buf for x in ["password", "slice", "path", "enter", "privilege"]):
+                            # Die unvollständige Zeile vor dem Dialog im GUI-Log anzeigen
+                            GLib.idle_add(self._append_log, f"[GUI-Prompt]: {clean_buffer}")
 
-                        if user_response is not None:
-                            # KORREKTUR: Antwort als Binärdaten (.encode()) mit Zeilenumbruch an DAR senden
-                            response_bytes = (user_response + "\n").encode("utf-8")
-                            process.stdin.write(response_bytes)
-                            process.stdin.flush()
-                        else:
-                            process.terminate()
-                            break
-                        buffer = ""
+                            user_response = self._prompt_user_interactive_queue(buffer)
+
+                            if user_response is not None:
+                                response_bytes = (user_response + "\n").encode("utf-8")
+                                os.write(master_fd, response_bytes)
+                            else:
+                                process.terminate()
+                                break
+                            buffer = ""
+
 
             if buffer:
                 GLib.idle_add(self._append_log, buffer.rstrip())
+
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
 
             returncode = process.wait()
             GLib.idle_add(self._extract_finished, returncode, destination)
@@ -664,101 +751,95 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             GLib.idle_add(self._extract_finished, -1, destination, str(exc))
 
 
-    def _prompt_user_interactive_sync(self, prompt_text: str) -> str | None:
+
+    def _prompt_user_interactive_queue(self, prompt_text: str) -> str | None:
         """
-        Öffnet einen flexiblen, synchronen Dialog im GTK4-Hauptthread über ein Gtk.Window.
-        Blockiert den Worker-Thread sicher, bis der Benutzer antwortet.
+        Öffnet einen universellen, interaktiven Dialog im GTK4-Hauptthread.
+        Nutzt feste Widget-Namen zur Rückgabe, um Vertauschungen im Speicher komplett auszuschließen.
         """
-        condition = threading.Condition()
-        user_input_container = [None]
+        response_queue = queue.Queue()
 
-        def ask_user():
-            with condition:
-                # KORREKTUR: Reines Gtk.Window statt veraltetem Gtk.Dialog nutzen
-                window = Gtk.Window(title="DAR Interaktion benötigt", transient_for=self, modal=True)
-                window.set_default_size(400, -1)
+        def ask_user_gui():
+            window = Gtk.Window(title="DAR Interaktion benötigt", transient_for=self, modal=True)
+            window.set_default_size(450, -1)
 
-                # Haupt-Layout
-                main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
-                main_box.set_margin_top(15)
-                main_box.set_margin_bottom(15)
-                main_box.set_margin_start(15)
-                main_box.set_margin_end(15)
-                window.set_child(main_box)
+            main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+            main_box.set_margin_top(15)
+            main_box.set_margin_bottom(15)
+            main_box.set_margin_start(15)
+            main_box.set_margin_end(15)
+            window.set_child(main_box)
 
-                # Textanzeige der Frage
-                label = Gtk.Label(label=prompt_text.strip())
-                label.set_xalign(0)
-                label.set_wrap(True)
-                main_box.append(label)
+            label = Gtk.Label(label=prompt_text.strip())
+            label.set_xalign(0)
+            label.set_wrap(True)
+            main_box.append(label)
 
-                # Eingabefeld (nur für Passwörter oder Slices)
-                entry = Gtk.Entry()
-                entry.set_hexpand(True)
+            entry = Gtk.Entry()
+            entry.set_hexpand(True)
 
-                is_yes_no = "[return = yes" in prompt_text.lower() or "esc = no" in prompt_text.lower()
+            is_yes_no = "[return = yes" in prompt_text.lower() or "esc = no" in prompt_text.lower()
 
-                if "password" in prompt_text.lower():
-                    entry.set_visibility(False)
-                if "slice" in prompt_text.lower() and self.current_archive:
-                    entry.set_text(self.current_archive)
+            if "password" in prompt_text.lower():
+                entry.set_visibility(False)
+            if "slice" in prompt_text.lower() and self.current_archive:
+                entry.set_text(self.current_archive)
 
-                if not is_yes_no:
-                    main_box.append(entry)
+            if not is_yes_no:
+                main_box.append(entry)
 
-                # Button-Leiste unten
-                button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-                button_box.set_halign(Gtk.Align.END)
-                main_box.append(button_box)
+            button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            button_box.set_halign(Gtk.Align.END)
+            main_box.append(button_box)
 
-                # Buttons erstellen
-                btn_cancel = Gtk.Button(label="Abbrechen")
-                button_box.append(btn_cancel)
+            # Die zentrale Klick-Funktion
+            def on_button_clicked(button):
+                # Wir holen uns den Wert stur aus dem Namen des geklickten Buttons!
+                btn_id = button.get_name()
 
-                if is_yes_no:
-                    btn_no = Gtk.Button(label="Nein (ESC)")
-                    btn_yes = Gtk.Button(label="Ja (Enter)")
-                    button_box.append(btn_no)
-                    button_box.append(btn_yes)
-                else:
-                    btn_ok = Gtk.Button(label="Bestätigen")
-                    button_box.append(btn_ok)
+                if btn_id == "cancel":
+                    response_queue.put(None)
+                elif btn_id == "yes":
+                    response_queue.put("") # Leerer String wird zu reiner Eingabetaste (\n)
+                elif btn_id == "no":
+                    response_queue.put("\x1b") # Echtes Escape-Zeichen
+                elif btn_id == "ok":
+                    response_queue.put(entry.get_text())
 
-                # Signal-Handler für die Buttons (Direkte Freigabe des Threads)
-                def finalize(result_value):
-                    user_input_container[0] = result_value
-                    window.close()  # Schließt das Fenster sauber in GTK4
+                window.close()
 
-                btn_cancel.connect("clicked", lambda _: finalize(None))
-                if is_yes_no:
-                    btn_no.connect("clicked", lambda _: finalize("no"))
-                    btn_yes.connect("clicked", lambda _: finalize(""))
-                else:
-                    btn_ok.connect("clicked", lambda _: finalize(entry.get_text()))
+            # Buttons bauen und eindeutige Namen verpassen
+            btn_cancel = Gtk.Button(label="Abbrechen")
+            btn_cancel.set_name("cancel")
+            btn_cancel.connect("clicked", on_button_clicked)
+            button_box.append(btn_cancel)
 
-                # Fallback, wenn der Benutzer das Fenster über das 'X' schließt
-                def on_close_request(_):
-                    with condition:
-                        condition.notify()
-                    return False
+            if is_yes_no:
+                btn_no = Gtk.Button(label="Nein (ESC)")
+                btn_no.set_name("no")
+                btn_no.connect("clicked", on_button_clicked)
 
-                window.connect("close-request", on_close_request)
+                btn_yes = Gtk.Button(label="Ja (Enter)")
+                btn_yes.set_name("yes")
+                btn_yes.connect("clicked", on_button_clicked)
 
-                # Zerstörungs-Signal nutzen, um den wartenden Thread aufzuwecken
-                def on_destroy(_):
-                    with condition:
-                        condition.notify()
+                button_box.append(btn_no)
+                button_box.append(btn_yes)
+            else:
+                btn_ok = Gtk.Button(label="Bestätigen")
+                btn_ok.set_name("ok")
+                btn_ok.connect("clicked", on_button_clicked)
+                button_box.append(btn_ok)
 
-                window.connect("destroy", on_destroy)
-                window.present()
+            def on_close_request(_):
+                response_queue.put(None)
+                return False
+            window.connect("close-request", on_close_request)
 
-        with condition:
-            GLib.idle_add(ask_user)
-            condition.wait()
+            window.present()
 
-        # Gibt den exakten Wert an den Worker zurück
-        return user_input_container[0]
-
+        GLib.idle_add(ask_user_gui)
+        return response_queue.get()
 
 
 
