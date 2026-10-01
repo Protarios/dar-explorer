@@ -53,8 +53,6 @@ def format_size(size_bytes_str: str) -> str:
         return size_bytes_str
 
 
-
-
 def format_date(timestamp_str: str) -> str:
     """Konvertiert den Unix-Timestamp aus dem XML in ein lesbares Datumsformat."""
     try:
@@ -64,17 +62,26 @@ def format_date(timestamp_str: str) -> str:
     except (ValueError, TypeError):
         return timestamp_str
 
-def run_dar_listing(path: str) -> tuple[list[ParsedEntry], str]:
+def run_dar_listing(path: str, password_callback=None) -> tuple[list[ParsedEntry], str]:
+    import pty
+    import os
+    import io
+
     archive_arg = normalize_archive_argument(path)
     env = os.environ.copy()
     env["LC_ALL"] = "C"
     env["LANG"] = "C"
 
+    # Wir nutzen ein PTY (Pseudo-Terminal), damit DAR die Passwort-Eingabe akzeptiert
+    master_fd, slave_fd = pty.openpty()
+
     try:
         process = subprocess.Popen(
             ["dar", "-l", archive_arg, "-T", "xml", "-w"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
             env=env,
         )
     except FileNotFoundError as exc:
@@ -82,53 +89,88 @@ def run_dar_listing(path: str) -> tuple[list[ParsedEntry], str]:
     except OSError as exc:
         raise RuntimeError(f"DAR konnte nicht gestartet werden: {exc}") from exc
 
+    os.close(slave_fd)
+
     entries: list[ParsedEntry] = []
     path_stack: list[str] = []
+    xml_accumulator = []
 
+    buffer = ""
+    parsing_started = False
+
+    while True:
+        try:
+            char_bytes = os.read(master_fd, 1)
+        except OSError:
+            break
+        if not char_bytes:
+            break
+
+        char = char_bytes.decode("utf-8", errors="replace")
+
+        if not parsing_started:
+            buffer += char
+            # Prüfen, ob eine Zeile abgeschlossen ist
+            if char == "\n":
+                # Wenn es normaler Text vor dem XML ist (z.B. die Warnung), sammeln wir ihn nicht fürs XML
+                buffer = ""
+            else:
+                clean_buf = buffer.strip()
+                # ERKENNUNG DER PASSWORT-ABFRAGE
+                if clean_buf.endswith("requires a password:"):
+                    if password_callback:
+                        # Popup in der GUI triggern
+                        password = password_callback(buffer)
+                        if password is not None:
+                            os.write(master_fd, (password + "\n").encode("utf-8"))
+                        else:
+                            process.terminate()
+                            raise RuntimeError("Archiv-Einlesen vom Benutzer abgebrochen (kein Passwort angegeben).")
+                    buffer = ""
+
+                # Sobald das erste XML-Zeichen auftaucht, schalten wir um
+                elif "<" in buffer:
+                    parsing_started = True
+                    # Den bisherigen Inhalt des Puffers (das '<' und evtl. Reste) fürs XML retten
+                    xml_accumulator.append(buffer.encode("utf-8"))
+                    buffer = ""
+        else:
+            # Wenn wir im XML-Modus sind, sammeln wir die Bytes direkt für den Parser
+            xml_accumulator.append(char_bytes)
+
+    # Den gesammelten XML-Stream im Speicher als Datei-ähnliches Objekt aufbereiten
+    xml_data = b"".join(xml_accumulator)
+
+    if not xml_data:
+        process.wait()
+        raise RuntimeError("Es wurden keine XML-Daten von DAR empfangen. Falsches Passwort?")
+
+    # Nun jagen wir die sauberen XML-Daten durch den bewährten ElementTree-Parser
     try:
-        context = ET.iterparse(process.stdout, events=("start", "end"))
+        # Inkrementelles XML-Parsing aus dem Speicher-Stream
+        context = ET.iterparse(io.BytesIO(xml_data), events=("start", "end"))
         for event, elem in context:
             tag = elem.tag.capitalize()
             name = elem.attrib.get("name", "").strip()
 
             if event == "start":
-                # DAR nutzt im XML oft das Tag 'Attributes' als Kind-Element für die Metadaten
                 if tag == "Directory" and name:
                     full_path = "/".join(path_stack + [name])
-                    path_stack.append(name)
-
-                    # Platzhalter-Eintrag, Attribute kommen im nächsten Schritt oder direkt
                     entries.append(ParsedEntry(
                         path=full_path, is_dir=True,
-                        permissions=elem.attrib.get("permissions", "drwxr-xr-x").strip(),
+                        permissions=elem.attrib.get("permissions", "drwxr-xr-x"),
                         user=elem.attrib.get("user", "unknown"), group=elem.attrib.get("group", "unknown"),
-                        size="—", date=format_date(elem.attrib.get("mtime", "—"))
+                        size="—", date=elem.attrib.get("date", "—")
                     ))
+                    path_stack.append(name)
                 elif tag == "File" and name:
                     file_path = "/".join(path_stack + [name])
                     entries.append(ParsedEntry(
                         path=file_path, is_dir=False,
-                        permissions=elem.attrib.get("permissions", "-rw-r----").strip(),
+                        permissions=elem.attrib.get("permissions", "-rw-r----"),
                         user=elem.attrib.get("user", "unknown"), group=elem.attrib.get("group", "unknown"),
-                        size=format_size(elem.attrib.get("size", "0")),
-                        date=format_date(elem.attrib.get("mtime", "—"))
+                        size=elem.attrib.get("size", "0"), date=elem.attrib.get("date", "—")
                     ))
-
-                # WICHTIG: DAR lagert bei neueren Versionen die Metadaten in ein eigenes Unter-Tag <Attributes> aus
-                elif tag == "Attributes" and entries:
-                    last_entry = entries[-1]
-                    # Wenn das Attribute-Tag existiert, überschreiben wir die Werte mit den echten XML-Daten
-                    if elem.attrib.get("permissions"):
-                        last_entry.permissions = elem.attrib.get("permissions", "").strip()
-                    if elem.attrib.get("user"):
-                        last_entry.user = elem.attrib.get("user", "unknown")
-                    if elem.attrib.get("group"):
-                        last_entry.group = elem.attrib.get("group", "unknown")
-                    if elem.attrib.get("mtime"):
-                        last_entry.date = format_date(elem.attrib.get("mtime"))
-                    if elem.attrib.get("size") and not last_entry.is_dir:
-                        last_entry.size = format_size(elem.attrib.get("size"))
-
             elif event == "end":
                 if tag == "Directory" and name and path_stack and path_stack[-1] == name:
                     path_stack.pop()
@@ -136,8 +178,7 @@ def run_dar_listing(path: str) -> tuple[list[ParsedEntry], str]:
 
     except ET.ParseError as err:
         process.terminate()
-        raise RuntimeError(f"XML Parse Fehler: {err}") from err
+        raise RuntimeError(f"XML Struktur-Fehler beim Laden: {err}. Eventuell falsches Passwort?") from err
 
-    stderr_output = process.stderr.read().decode("utf-8", errors="replace")
     process.wait()
-    return entries, stderr_output.strip()
+    return entries, ""

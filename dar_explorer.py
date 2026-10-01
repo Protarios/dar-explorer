@@ -384,10 +384,17 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
     def _load_worker(self, path):
         try:
-            entries, warning = run_dar_listing(path)
+            # Wir definieren eine kleine Brücke, die das GUI-Popup aufruft
+            def password_callback(prompt_text):
+                # Nutzt unseren bereits existierenden, stabilen Queue-Dialog!
+                return self._prompt_user_interactive_queue(prompt_text)
+
+            # KORREKTUR: Wir übergeben die Brücke an den Parser
+            entries, warning = run_dar_listing(path, password_callback)
             GLib.idle_add(self._load_finished, path, entries, warning, None)
         except Exception as exc:
             GLib.idle_add(self._load_finished, path, None, "", str(exc))
+
 
     def _load_finished(self, path, entries, warning, error):
         self.loading = False
