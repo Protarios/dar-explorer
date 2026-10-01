@@ -135,12 +135,15 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.set_title("DAR Explorer V2")
 
         self.current_archive = None
+        self.archive_password = None  # NEU: Speichert das eingegebene Passwort im Hauptfenster
         self.all_nodes = []
         self.root_store = None
         self.loading = False
         self.extracting = False
+        self._gui_file_count = 0  # Falls noch nicht vorhanden, für den Tacho
 
         self._build_ui()
+
 
     def _build_ui(self):
         header = Gtk.HeaderBar()
@@ -413,24 +416,54 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             def password_callback(prompt_text):
                 return self._prompt_user_interactive_queue(prompt_text)
 
-            # KORREKTUR: *args erlaubt es der Brücke, flexibel zu reagieren.
-            # Wenn ein Argument übergeben wird, nehmen wir das erste (args[0]).
-            # Wenn kein Argument kommt, übergeben wir None.
             def progress_bridge(*args):
                 count = args[0] if args else None
                 GLib.idle_add(self._pulse_progress, count)
 
-            # WICHTIG: Wir übergeben die Callbacks explizit als Named-Arguments.
-            # Das zwingt Python dazu, die Funktionen exakt den richtigen Variablen zuzuordnen.
+            archive_arg = normalize_archive_argument(path)
+
+            # KORREKTUR: shlex.quote schützt Pfade mit Leerzeichen vor der Shell.
+            # shell=True stellt sicher, dass 'dar' im System-PATH gefunden wird!
+            import shlex
+            check_cmd = f"dar -l {shlex.quote(archive_arg)} -Q"
+
+            check_process = subprocess.Popen(
+                check_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=True,
+                env={"LC_ALL": "C", "LANG": "C"}
+            )
+            _, check_stderr = check_process.communicate()
+            returncode = check_process.wait()
+
+            # Wenn der Vorab-Check fehlschlägt, ist das Archiv verschlüsselt
+            if returncode != 0:
+                GLib.idle_add(self._force_show_log)
+                GLib.idle_add(self._append_log, "[System]: Archiv geschützt. Passwort wird benötigt...")
+
+                pwd = self._prompt_user_interactive_queue("Bitte gib das Passwort für das Archiv ein:")
+                if pwd is not None:
+                    self.archive_password = pwd
+                    # DEBUG: Prüfen, ob das Passwort nach dem Popup im Thread existiert
+                    print(f"[DEBUG GUI] Passwort empfangen: {'*' * len(pwd)} (Länge: {len(pwd)})")
+                else:
+                    raise RuntimeError("Archiv-Einlesen vom Benutzer abgebrochen.")
+
+            # DEBUG: Vor dem Aufruf der Pipeline prüfen, was übergeben wird
+            print(f"[DEBUG GUI] Starte run_dar_listing mit Passwort-Zustand: {self.archive_password is not None}")
+
+            # 2. Die originale, unberührte Pipeline ausführen
             entries, warning = run_dar_listing(
                 path,
                 password_callback=password_callback,
-                progress_callback=progress_bridge
+                progress_callback=progress_bridge,
+                encryption_password=self.archive_password
             )
             GLib.idle_add(self._load_finished, path, entries, warning, None)
+
         except Exception as exc:
             GLib.idle_add(self._load_finished, path, None, "", str(exc))
-
 
 
     def _load_finished(self, path, entries, warning, error):
@@ -892,8 +925,11 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
             is_yes_no = "[return = yes" in prompt_text.lower() or "esc = no" in prompt_text.lower()
 
-            if "password" in prompt_text.lower():
+            # KORREKTUR: Erkennt nun "password" und "passwort" für die Maskierung
+            prompt_lower = prompt_text.lower()
+            if "password" in prompt_lower or "passwort" in prompt_lower:
                 entry.set_visibility(False)
+
             if "slice" in prompt_text.lower() and self.current_archive:
                 entry.set_text(self.current_archive)
 

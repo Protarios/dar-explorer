@@ -23,7 +23,8 @@ class ParsedEntry:
 
 def normalize_archive_argument(path: str) -> str:
     path = os.path.expanduser(path)
-    m = re.match(r"^(.*)\.(\d+)\.dar\$", path)
+    # KORREKTUR: '$' statt '\$' am Ende, damit das Zeilenende korrekt erkannt wird!
+    m = re.match(r"^(.*)\.(\d+)\.dar$", path)
     return m.group(1) if m else path
 
 def format_size(size_bytes_str: str) -> str:
@@ -62,7 +63,7 @@ def format_date(timestamp_str: str) -> str:
         return timestamp_str
 
 
-def run_dar_listing(path: str, password_callback=None, progress_callback=None) -> tuple[list[ParsedEntry], str]:
+def run_dar_listing(path: str, password_callback=None, progress_callback=None, encryption_password=None) -> tuple[list[ParsedEntry], str]:
     import io
     import xml.etree.ElementTree as ET
 
@@ -71,32 +72,44 @@ def run_dar_listing(path: str, password_callback=None, progress_callback=None) -
     env["LC_ALL"] = "C"
     env["LANG"] = "C"
 
+    cmd = ["dar", "-l", archive_arg, "-T", "xml", "-w"]
+    if encryption_password:
+        cmd.extend(["-K", encryption_password])
+
     try:
         process = subprocess.Popen(
-            ["dar", "-l", archive_arg, "-T", "xml", "-w"],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
             env=env,
         )
-    except FileNotFoundError as exc:
-        raise RuntimeError("DAR wurde nicht gefunden. Bitte prüfen, ob `dar` im PATH liegt.") from exc
-    except OSError as exc:
-        raise RuntimeError(f"DAR konnte nicht gestartet werden: {exc}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"DAR konnte nicht gestartet werden: {exc}")
 
     if process.stdin:
         process.stdin.close()
 
     entries: list[ParsedEntry] = []
     path_stack: list[str] = []
-
     xml_parser = ET.XMLPullParser(["start", "end"])
-    last_reported_count = 0
+    line_counter = 0
 
     if process.stdout:
         for line in process.stdout:
-            xml_parser.feed(line)
+            # PURE DATEN-REINIGUNG: Wir ignorieren Zeilen, die nicht mit '<' beginnen.
+            # Das filtert die DAR-Warnung ('Warning, the archive...') in Zeile 0 sauber heraus!
+            clean_line = line.strip()
+            if not clean_line or not clean_line.startswith(b"<"):
+                continue
+
+            try:
+                xml_parser.feed(line)
+            except ET.ParseError as err:
+                # Falls später im XML etwas schiefgeht, loggen wir es zur Sicherheit im Terminal
+                print(f"[DEBUG PARSER] XML-Fehler bei Zeile: {clean_line.decode('utf-8', errors='replace')}")
+                raise
 
             for event, elem in xml_parser.read_events():
                 tag = elem.tag.capitalize()
@@ -109,7 +122,7 @@ def run_dar_listing(path: str, password_callback=None, progress_callback=None) -
                             path=full_path, is_dir=True,
                             permissions=elem.attrib.get("permissions", "drwxr-xr-x"),
                             user=elem.attrib.get("user", "unknown"), group=elem.attrib.get("group", "unknown"),
-                            size="—", date=elem.attrib.get("date", "—")
+                            size="—", date="—"
                         ))
                         path_stack.append(name)
                     elif tag == "File" and name:
@@ -118,36 +131,29 @@ def run_dar_listing(path: str, password_callback=None, progress_callback=None) -
                             path=file_path, is_dir=False,
                             permissions=elem.attrib.get("permissions", "-rw-r----"),
                             user=elem.attrib.get("user", "unknown"), group=elem.attrib.get("group", "unknown"),
-                            size=elem.attrib.get("size", "0"), date=elem.attrib.get("date", "—")
+                            size=format_size(elem.attrib.get("size", "0")),
+                            date=format_date(elem.attrib.get("date", "—"))
                         ))
                 elif event == "end":
                     if tag == "Directory" and name and path_stack and path_stack[-1] == name:
                         path_stack.pop()
                     elem.clear()
 
-            # Übergibt den Fortschritt stabil an die Bridge
             if progress_callback:
-                current_count = len(entries)
-                if current_count - last_reported_count >= 5000:
-                    progress_callback(current_count)
-                    last_reported_count = current_count
-
-        if progress_callback:
-            progress_callback(len(entries))
+                line_counter += 1
+                if line_counter >= 5000:
+                    progress_callback(len(entries))
+                    line_counter = 0
 
         xml_parser.close()
 
-    stderr_data = ""
-    if process.stderr:
-        stderr_data = process.stderr.read().decode("utf-8", errors="replace")
-
+    stderr_data = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
     returncode = process.wait()
 
     if returncode != 0:
-        error_msg = stderr_data.strip() or f"Exit-Code {returncode}"
-        raise RuntimeError(f"DAR meldete einen Fehler beim Einlesen:\n{error_msg}")
+        raise RuntimeError(stderr_data.strip() or f"Exit-Code {returncode}")
 
     if not entries:
-        raise RuntimeError("Es wurden keine Einträge aus dem Archiv gelesen. Ist das Archiv verschlüsselt oder beschädigt?")
+        raise RuntimeError("Es wurden keine Einträge aus dem Archiv gelesen. Falsches Passwort oder beschädigtes Archiv?")
 
     return entries, ""
