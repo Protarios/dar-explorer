@@ -364,6 +364,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         node = row.get_item()
         expander.get_child().set_text(("📁  " if node.is_dir else "📄  ") + node.name)
 
+
     def load_archive(self, path):
         if self.loading or self.extracting:
             return
@@ -372,26 +373,39 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.current_archive = path
         self.loading = True
 
+        # Internen Zähler für die GUI zurücksetzen
+        self._gui_file_count = 0
+
         self.reload_btn.set_sensitive(False)
         self.extract_btn.set_sensitive(False)
         self.archive_label.set_text(f"Archiv: {path}")
         self.path_label.set_text("DAR-Listing wird eingelesen …")
         self.status_label.set_text("DAR wird ausgeführt …")
 
-        # NEU: Fortschrittsbalken vorbereiten und sichtbar machen (Aktivitätsmodus)
         self.progress.set_fraction(0.0)
-        self.progress.set_text("Analysiere Archivstruktur...")
+        self.progress.set_text("Analysiere Archivstruktur... (0 Einträge)")
         self.progress.set_visible(True)
 
         threading.Thread(
             target=self._load_worker, args=(path,), daemon=True
         ).start()
 
-    # NEU: Hilfsmethode für den Worker-Thread, um die GUI zu aktualisieren
-    def _pulse_progress(self):
-        if self.loading:
-            self.progress.pulse()
-        return False  # Verhindert, dass GLib die Funktion mehrfach aufruft
+    # KORREKTUR: 'count' ist jetzt optional (=None). Das verhindert den "missing argument"-Fehler komplett,
+    # egal wie oder von wo GTK diese Methode im Hauptthread ansteuert!
+    def _pulse_progress(self, count=None):
+        if not self.loading:
+            return False
+
+        self.progress.pulse()
+
+        # Wenn eine neue Zahl reinkommt, updaten wir unseren internen Speicher
+        if count is not None:
+            self._gui_file_count = count
+
+        formatted_count = f"{self._gui_file_count:,}".replace(",", ".")
+        self.progress.set_text(f"Analysiere Archivstruktur... ({formatted_count} Einträge eingelesen)")
+
+        return False  # WICHTIG: Sagt GTK, dass die Funktion NICHT automatisch wiederholt werden soll
 
 
     def _load_worker(self, path):
@@ -399,15 +413,24 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             def password_callback(prompt_text):
                 return self._prompt_user_interactive_queue(prompt_text)
 
-            # NEU: Ein zweites Callback, das GLib.idle_add nutzt, um den Balken zu bewegen
-            def progress_bridge():
-                GLib.idle_add(self._pulse_progress)
+            # KORREKTUR: *args erlaubt es der Brücke, flexibel zu reagieren.
+            # Wenn ein Argument übergeben wird, nehmen wir das erste (args[0]).
+            # Wenn kein Argument kommt, übergeben wir None.
+            def progress_bridge(*args):
+                count = args[0] if args else None
+                GLib.idle_add(self._pulse_progress, count)
 
-            # KORREKTUR: Beide Callbacks an den Parser übergeben
-            entries, warning = run_dar_listing(path, password_callback, progress_bridge)
+            # WICHTIG: Wir übergeben die Callbacks explizit als Named-Arguments.
+            # Das zwingt Python dazu, die Funktionen exakt den richtigen Variablen zuzuordnen.
+            entries, warning = run_dar_listing(
+                path,
+                password_callback=password_callback,
+                progress_callback=progress_bridge
+            )
             GLib.idle_add(self._load_finished, path, entries, warning, None)
         except Exception as exc:
             GLib.idle_add(self._load_finished, path, None, "", str(exc))
+
 
 
     def _load_finished(self, path, entries, warning, error):

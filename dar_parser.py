@@ -32,7 +32,6 @@ def format_size(size_bytes_str: str) -> str:
     Schneidet störende Einheiten wie 'o' ab, um Abstürze zu verhindern.
     """
     try:
-        # Bereinigung: Entfernt 'o', 'B' und Leerzeichen (z.B. "51 o" -> "51")
         clean_str = re.sub(r"[ \toB]", "", size_bytes_str)
         if not clean_str:
             return "0 B"
@@ -62,6 +61,7 @@ def format_date(timestamp_str: str) -> str:
     except (ValueError, TypeError):
         return timestamp_str
 
+
 def run_dar_listing(path: str, password_callback=None, progress_callback=None) -> tuple[list[ParsedEntry], str]:
     import io
     import xml.etree.ElementTree as ET
@@ -71,7 +71,6 @@ def run_dar_listing(path: str, password_callback=None, progress_callback=None) -
     env["LC_ALL"] = "C"
     env["LANG"] = "C"
 
-    # Zurück zur alten, pfeilschnellen Pipeline via PIPEs (ohne PTY-Bremse)
     try:
         process = subprocess.Popen(
             ["dar", "-l", archive_arg, "-T", "xml", "-w"],
@@ -86,24 +85,19 @@ def run_dar_listing(path: str, password_callback=None, progress_callback=None) -
     except OSError as exc:
         raise RuntimeError(f"DAR konnte nicht gestartet werden: {exc}") from exc
 
-    # Da wir Passwörter vorerst ignorieren, schließen wir stdin sofort
     if process.stdin:
         process.stdin.close()
 
     entries: list[ParsedEntry] = []
     path_stack: list[str] = []
 
-    # Wir nutzen den XMLPullParser für echtes Stream-Parsing in Echtzeit
     xml_parser = ET.XMLPullParser(["start", "end"])
-    line_counter = 0
+    last_reported_count = 0
 
-    # stdout Zeile für Zeile streamen
-    # Das ist extrem speicherschonend und nutzt die volle IO-Geschwindigkeit aus
     if process.stdout:
         for line in process.stdout:
             xml_parser.feed(line)
 
-            # Die eingegangenen XML-Events SOFORT verarbeiten, während DAR ausgibt
             for event, elem in xml_parser.read_events():
                 tag = elem.tag.capitalize()
                 name = elem.attrib.get("name", "").strip()
@@ -129,18 +123,20 @@ def run_dar_listing(path: str, password_callback=None, progress_callback=None) -
                 elif event == "end":
                     if tag == "Directory" and name and path_stack and path_stack[-1] == name:
                         path_stack.pop()
-                    elem.clear()  # Verhindert, dass der RAM mit alten XML-Knoten vollzieht
+                    elem.clear()
 
-            # Fortschrittsbalken alle 2.000 XML-Zeilen updaten für ein flüssiges UI-Gefühl
+            # Übergibt den Fortschritt stabil an die Bridge
             if progress_callback:
-                line_counter += 1
-                if line_counter >= 2000:
-                    progress_callback()
-                    line_counter = 0
+                current_count = len(entries)
+                if current_count - last_reported_count >= 5000:
+                    progress_callback(current_count)
+                    last_reported_count = current_count
+
+        if progress_callback:
+            progress_callback(len(entries))
 
         xml_parser.close()
 
-    # Fehlerkanal (stderr) prüfen, falls DAR unerwartet abbricht
     stderr_data = ""
     if process.stderr:
         stderr_data = process.stderr.read().decode("utf-8", errors="replace")
@@ -148,7 +144,6 @@ def run_dar_listing(path: str, password_callback=None, progress_callback=None) -
     returncode = process.wait()
 
     if returncode != 0:
-        # Falls es ein unverschlüsseltes Archiv mit echtem Fehler ist, zeigen wir ihn an
         error_msg = stderr_data.strip() or f"Exit-Code {returncode}"
         raise RuntimeError(f"DAR meldete einen Fehler beim Einlesen:\n{error_msg}")
 
