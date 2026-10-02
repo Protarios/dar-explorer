@@ -803,6 +803,10 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         import shlex
         from dar_runner import DarProcessRunner
 
+        # --- KONFIGURATION FÜR DEIN BAND- / SLICE-LAGER ---
+        SLICE_LAGER_PATH = os.path.expanduser("~/mein_band_archiv")
+        # --------------------------------------------------
+
         clean_archive = archive_arg
         if archive_arg.endswith(".dar"):
             clean_archive = re.sub(r"\.\d+\.dar$", "", archive_arg)
@@ -843,14 +847,45 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             return self._prompt_user_interactive_queue(prompt_text)
 
         try:
-            # Den neuen pexpect-basierten Runner starten
-            runner = DarProcessRunner(cmd)
-            returncode = runner.run(line_callback=handle_line, interaction_callback=handle_interaction)
+            # Diese Variable merkt sich, ob der Krypto-Fehler im Stream aufgetaucht ist
+            has_crypto_error = False
 
-            GLib.idle_add(self._extract_finished, returncode, destination)
+            def intercept_line(line_to_log):
+                nonlocal has_crypto_error
+                lower_line = line_to_log.lower()
+
+                # Wenn das kryptische Terminal-Rauschen im Textstrom auftaucht:
+                if "elastic buffer" in lower_line or "incoherent structure" in lower_line:
+                    has_crypto_error = True
+                    # Wir stoppen den Runner SOFORT von hier aus, damit DAR nicht blockiert!
+                    runner.terminate()
+                    return
+
+                # Alle anderen normalen Zeilen wandern ganz regulär in die Anzeige
+                handle_line(line_to_log)
+
+            # Den pexpect-basierten Runner starten
+            runner = DarProcessRunner(cmd, slice_lager_path=SLICE_LAGER_PATH)
+            returncode = runner.run(line_callback=intercept_line, interaction_callback=handle_interaction)
+
+            # DIE UMLEITUNG FÜR DAS POPUP:
+            # Wenn has_crypto_error auf True gesetzt wurde (oder der Runner wegen Krypto abbricht)
+            if has_crypto_error or returncode == -5 or returncode == 5:
+                # Das falsche Passwort sofort aus dem Speicher werfen
+                self.archive_password = None
+
+                # Wir rufen _extract_finished auf und übergeben als Fehlertext unsere saubere Meldung
+                GLib.idle_add(self._extract_finished, -1, destination,
+                              "Entschlüsselung fehlgeschlagen!\n\n"
+                              "Das eingegebene Passwort ist falsch oder das Archiv "
+                              "wurde mit einem anderen Schlüssel gesichert.")
+            else:
+                # Wenn alles normal lief, verhält sich das Tool wie gewohnt
+                GLib.idle_add(self._extract_finished, returncode, destination)
 
         except Exception as exc:
             GLib.idle_add(self._extract_finished, -1, destination, str(exc))
+
 
 
 

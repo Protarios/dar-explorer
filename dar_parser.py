@@ -147,21 +147,30 @@ def run_dar_listing(path: str, password_callback=None, progress_callback=None, e
                     progress_callback(len(entries))
                     line_counter = 0
 
-        xml_parser.close()
+        # KORREKTUR: Wir schließen den Parser nur, wenn wir auch Einträge gefunden haben.
+        # Wenn 'entries' leer ist, hat DAR wegen eines falschen Passworts abgebrochen.
+        # Das Schließen von xml_parser würde hier sonst den 'no element found' Absturz erzeugen!
+        if entries:
+            try:
+                xml_parser.close()
+            except ET.ParseError:
+                pass
 
-    # Fehlerkanal auslesen, falls stdout versiegt ist
     stderr_data = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
     returncode = process.wait()
 
     if returncode != 0:
-        # Hier fangen wir die Meldung ab, dass die letzte Slice fehlt!
         error_msg = stderr_data.strip()
+        # Spezifische Prüfung auf Passwortfehler im Fehlerstrom von DAR
+        if "password" in error_msg.lower() or "auth" in error_msg.lower() or "krypt" in error_msg.lower():
+            raise RuntimeError("Das eingegebene Passwort ist falsch oder ungültig.")
         if not error_msg:
-            error_msg = f"DAR abgebrochen (Exit-Code {returncode}). Letzte Slice des Archivs fehlt vermutlich!"
+            error_msg = f"DAR abgebrochen (Exit-Code {returncode}). Falsches Passwort oder beschädigte Datei?"
         raise RuntimeError(error_msg)
 
     if not entries:
-        raise RuntimeError("Es wurden keine Einträge aus dem Archiv gelesen. Letzte Slice fehlt oder Passwort falsch.")
+        raise RuntimeError("Das Passwort ist falsch oder das Archiv enthält keine lesbaren Daten.")
 
     return entries, ""
+
 

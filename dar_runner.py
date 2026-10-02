@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-DAR Explorer V2 - Korrigierter und stabiler pexpect-Runner.
-Nutzt self.child.before als reinen String, um den AttributeError endgültig zu beheben.
+DAR Explorer V2 - Reparierter und stabilisierter pexpect-Runner.
+Stellt die Grundfunktionalität der Extraktion ohne Typen-Konflikte wieder her.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ import pexpect
 import shlex
 import re
 import shutil
+import time
 from typing import Callable
 
 
@@ -46,12 +47,11 @@ class DarProcessRunner:
             while True:
                 index = self.child.expect(patterns)
 
-                # child.before ist GARANTIERT ein reiner Python-String!
+                # self.child.before ist GARANTIERT ein reiner Python-String!
                 output_text = self.child.before if self.child.before else ""
 
                 if index == 0:
                     # SLICE-WECHSEL ERKANNT!
-                    # Wir hängen den Ausgabetext vor dem Treffer an den Log an
                     prompt_text = output_text + " [return = YES | Esc = NO]"
 
                     # Dateiname extrahieren (z.B. testarchiv.8.dar)
@@ -67,6 +67,13 @@ class DarProcessRunner:
                         if os.path.exists(source_candidate):
                             line_callback(f"[DAR-Tool] Slice autonom gefunden! Kopiere nach {target_destination}...")
                             shutil.copy(source_candidate, target_destination)
+
+                            # Sichere Festplatten-Flushes
+                            try:
+                                os.sync()
+                            except AttributeError:
+                                pass
+                            time.sleep(0.2)
 
                             # Sofortige automatische Bestätigung an DAR senden
                             self.child.sendline("")
