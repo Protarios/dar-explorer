@@ -15,10 +15,10 @@ from typing import Callable
 
 
 class DarProcessRunner:
-    def __init__(self, cmd: list[str], slice_lager_path: str = "~/mein_band_archiv"):
+    def __init__(self, cmd: list[str], slice_lager_path: str):
         """
-        :param cmd: Die Argumenten-Liste für DAR
-        :param slice_lager_path: Der Pfad zum Band-/Schnipsel-Lager
+        :param cmd: Die Argumenten-Liste für DAR (z.B. ["dar", "-x", ...])
+        :param slice_lager_path: Der Pfad zum Band-/Schnipsel-Lager (MUSS explizit übergeben werden!)
         """
         self.cmd = cmd
         self.slice_lager_path = os.path.expanduser(slice_lager_path)
