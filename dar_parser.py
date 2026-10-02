@@ -96,20 +96,22 @@ def run_dar_listing(path: str, password_callback=None, progress_callback=None, e
     xml_parser = ET.XMLPullParser(["start", "end"])
     line_counter = 0
 
+    # WICHTIG: Wir nutzen select oder einfaches Auslesen. Da DAR bei fehlendem
+    # Katalog sofort stoppt, lesen wir stdout zeilenweise.
     if process.stdout:
         for line in process.stdout:
-            # PURE DATEN-REINIGUNG: Wir ignorieren Zeilen, die nicht mit '<' beginnen.
-            # Das filtert die DAR-Warnung ('Warning, the archive...') in Zeile 0 sauber heraus!
             clean_line = line.strip()
+            # Wenn DAR Fehler ausgibt, fängt es meist nicht mit XML an
+            if not clean_line.startswith(b"<") and b"error" in clean_line.lower():
+                break
+
             if not clean_line or not clean_line.startswith(b"<"):
                 continue
 
             try:
                 xml_parser.feed(line)
-            except ET.ParseError as err:
-                # Falls später im XML etwas schiefgeht, loggen wir es zur Sicherheit im Terminal
-                print(f"[DEBUG PARSER] XML-Fehler bei Zeile: {clean_line.decode('utf-8', errors='replace')}")
-                raise
+            except ET.ParseError:
+                break
 
             for event, elem in xml_parser.read_events():
                 tag = elem.tag.capitalize()
@@ -147,13 +149,19 @@ def run_dar_listing(path: str, password_callback=None, progress_callback=None, e
 
         xml_parser.close()
 
+    # Fehlerkanal auslesen, falls stdout versiegt ist
     stderr_data = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
     returncode = process.wait()
 
     if returncode != 0:
-        raise RuntimeError(stderr_data.strip() or f"Exit-Code {returncode}")
+        # Hier fangen wir die Meldung ab, dass die letzte Slice fehlt!
+        error_msg = stderr_data.strip()
+        if not error_msg:
+            error_msg = f"DAR abgebrochen (Exit-Code {returncode}). Letzte Slice des Archivs fehlt vermutlich!"
+        raise RuntimeError(error_msg)
 
     if not entries:
-        raise RuntimeError("Es wurden keine Einträge aus dem Archiv gelesen. Falsches Passwort oder beschädigtes Archiv?")
+        raise RuntimeError("Es wurden keine Einträge aus dem Archiv gelesen. Letzte Slice fehlt oder Passwort falsch.")
 
     return entries, ""
+

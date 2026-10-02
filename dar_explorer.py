@@ -798,23 +798,22 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
 
     def _extract_worker(self, archive_arg, paths, destination, restore_ownership, total_expected_files):
-        import pty
-        import os
-        import subprocess
         import re
+        import os
+        import shlex
+        from dar_runner import DarProcessRunner
 
         clean_archive = archive_arg
         if archive_arg.endswith(".dar"):
             clean_archive = re.sub(r"\.\d+\.dar$", "", archive_arg)
 
-        cmd = ["dar", "-x", clean_archive, "-R", destination, "-w"]
-
+        # Befehl zusammenbauen (Wichtig: mit -w, da pexpect auf die Prompts wartet!)
+        cmd = ["dar", "-x", clean_archive, "-R", destination, "-w", "--sequential-read"]
         if restore_ownership:
             cmd = ["sudo", "-S"] + cmd
         else:
             cmd.append("-O")
 
-        # Das gemerkte Passwort nutzen, falls vorhanden (wird später wichtig)
         if hasattr(self, 'archive_password') and self.archive_password:
             cmd.extend(["-K", self.archive_password])
 
@@ -822,93 +821,32 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             if path:
                 cmd.extend(["-g", path])
 
-        env = os.environ.copy()
-        env["LC_ALL"] = "C"
-        env["LANG"] = "C"
+        self._append_log_threadsafe("$ " + " ".join(shlex.quote(x) for x in cmd))
+
+        extracted_count = 0
+
+        # Callback für die Textzeilen (Log & Tacho)
+        def handle_line(line_to_log):
+            nonlocal extracted_count
+            if line_to_log:
+                extracted_count += 1
+                fraction = min(1.0, extracted_count / total_expected_files)
+                percentage = int(fraction * 100)
+                text = f"Entpacke... {percentage}% ({extracted_count:,} von {total_expected_files:,})".replace(",", ".")
+
+                GLib.idle_add(lambda: self.progress.set_fraction(fraction) or self.progress.set_text(text) or self._append_log(line_to_log))
+
+        # Callback für das GUI-Popup
+        def handle_interaction(prompt_text):
+            GLib.idle_add(self._force_show_log)
+            # Nutzt dein stabiles GTK-Popup. Liefert bei "Ja" -> "", bei "Abbrechen" -> None
+            return self._prompt_user_interactive_queue(prompt_text)
 
         try:
-            self._append_log_threadsafe("$ " + " ".join(self._shell_quote(x) for x in cmd))
+            # Den neuen pexpect-basierten Runner starten
+            runner = DarProcessRunner(cmd)
+            returncode = runner.run(line_callback=handle_line, interaction_callback=handle_interaction)
 
-            master_fd, slave_fd = pty.openpty()
-
-            process = subprocess.Popen(
-                cmd,
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                close_fds=True,
-                env=env,
-            )
-
-            os.close(slave_fd)
-
-            buffer = ""
-            extracted_count = 0  # NEU: Zähler für entpackte Dateien
-
-            # Eine kleine thread-sichere Brücke zur UI-Aktualisierung
-            def update_extraction_ui(current_fraction, current_text, log_line=None):
-                self.progress.set_fraction(current_fraction)
-                self.progress.set_text(current_text)
-                if log_line:
-                    self._append_log(log_line)
-                return False
-
-            while True:
-                try:
-                    char_bytes = os.read(master_fd, 1)
-                except OSError:
-                    break
-
-                if not char_bytes:
-                    break
-
-                char = char_bytes.decode("utf-8", errors="replace")
-                buffer += char
-
-                if char == "\n":
-                    line_to_log = buffer.rstrip()
-                    buffer = ""
-
-                    if line_to_log:
-                        # NEU: Jede nicht-leere Zeile erhöht den Fortschritt
-                        extracted_count += 1
-
-                        # Prozentwert berechnen (skaliert von 0.0 bis 1.0)
-                        fraction = min(1.0, extracted_count / total_expected_files)
-                        percentage = int(fraction * 100)
-
-                        text = f"Entpacke Dateien... {percentage}% ({extracted_count:,} von {total_expected_files:,})".replace(",", ".")
-                        GLib.idle_add(update_extraction_ui, fraction, text, line_to_log)
-
-                else:
-                    clean_buffer = buffer.strip()
-
-                    if clean_buffer.endswith("]") or clean_buffer.endswith(":") or clean_buffer.endswith("?"):
-                        lower_buf = clean_buffer.lower()
-
-                        if any(x in lower_buf for x in ["password", "slice", "path", "enter", "privilege"]):
-                            GLib.idle_add(self._force_show_log)
-                            GLib.idle_add(self._append_log, f"[GUI-Prompt]: {clean_buffer}")
-
-                            user_response = self._prompt_user_interactive_queue(buffer)
-
-                            if user_response is not None:
-                                response_bytes = (user_response + "\n").encode("utf-8")
-                                os.write(master_fd, response_bytes)
-                            else:
-                                process.terminate()
-                                break
-                            buffer = ""
-
-            if buffer:
-                GLib.idle_add(self._append_log, buffer.rstrip())
-
-            try:
-                os.close(master_fd)
-            except OSError:
-                pass
-
-            returncode = process.wait()
             GLib.idle_add(self._extract_finished, returncode, destination)
 
         except Exception as exc:
@@ -916,11 +854,10 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
 
 
-
     def _prompt_user_interactive_queue(self, prompt_text: str) -> str | None:
         """
         Öffnet einen universellen, interaktiven Dialog im GTK4-Hauptthread.
-        Nutzt feste Widget-Namen zur Rückgabe, um Vertauschungen im Speicher komplett auszuschließen.
+        Nutzt feste Widget-Namen zur Rückgabe. 'Nein' bricht den Vorgang jetzt sauber ab.
         """
         response_queue = queue.Queue()
 
@@ -945,7 +882,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
             is_yes_no = "[return = yes" in prompt_text.lower() or "esc = no" in prompt_text.lower()
 
-            # KORREKTUR: Erkennt nun "password" und "passwort" für die Maskierung
             prompt_lower = prompt_text.lower()
             if "password" in prompt_lower or "passwort" in prompt_lower:
                 entry.set_visibility(False)
@@ -962,32 +898,32 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
             # Die zentrale Klick-Funktion
             def on_button_clicked(button):
-                # Wir holen uns den Wert stur aus dem Namen des geklickten Buttons!
                 btn_id = button.get_name()
 
-                if btn_id == "cancel":
+                if btn_id == "cancel" or btn_id == "no":
+                    # 'no' liefert jetzt ebenfalls None zurück, damit der Worker process.terminate() ruft
                     response_queue.put(None)
                 elif btn_id == "yes":
                     response_queue.put("") # Leerer String wird zu reiner Eingabetaste (\n)
-                elif btn_id == "no":
-                    response_queue.put("\x1b") # Echtes Escape-Zeichen
                 elif btn_id == "ok":
                     response_queue.put(entry.get_text())
 
                 window.close()
 
-            # Buttons bauen und eindeutige Namen verpassen
-            btn_cancel = Gtk.Button(label="Abbrechen")
-            btn_cancel.set_name("cancel")
-            btn_cancel.connect("clicked", on_button_clicked)
-            button_box.append(btn_cancel)
+            # Nur wenn es KEINE reine Ja/Nein-Frage ist, zeigen wir den klassischen Abbrechen-Button
+            if not is_yes_no:
+                btn_cancel = Gtk.Button(label="Abbrechen")
+                btn_cancel.set_name("cancel")
+                btn_cancel.connect("clicked", on_button_clicked)
+                button_box.append(btn_cancel)
 
             if is_yes_no:
-                btn_no = Gtk.Button(label="Nein (ESC)")
+                # 'Nein' agiert jetzt als sauberer Abbruch-Knopf
+                btn_no = Gtk.Button(label="Nein / Abbrechen (ESC)")
                 btn_no.set_name("no")
                 btn_no.connect("clicked", on_button_clicked)
 
-                btn_yes = Gtk.Button(label="Ja (Enter)")
+                btn_yes = Gtk.Button(label="Ja / Weiter (Enter)")
                 btn_yes.set_name("yes")
                 btn_yes.connect("clicked", on_button_clicked)
 
@@ -1008,6 +944,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
         GLib.idle_add(ask_user_gui)
         return response_queue.get()
+
 
 
 
