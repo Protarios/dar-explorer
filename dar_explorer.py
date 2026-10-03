@@ -571,17 +571,12 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                 if not dar_mgr_bin:
                     raise RuntimeError(
                         "Das Systemwerkzeug 'dar_manager' ist nicht installiert.\n"
-                        "Bitte installieren Sie das Paket 'dar' (z. B. mit 'sudo apt install dar')."
+                        "Bitte installieren Sie das Paket 'dar'."
                     )
 
                 if os.path.exists(self.current_dmd_db):
                     try: os.remove(self.current_dmd_db)
                     except Exception: pass
-
-                dar_mgr_cmd = dar_mgr_bin or "dar_manager"
-                create_res = subprocess.run([dar_mgr_cmd, "-C", self.current_dmd_db], capture_output=True, text=True)
-                if create_res.returncode != 0:
-                    raise RuntimeError(f"Fehler beim Erstellen der DMD-Datenbank: {create_res.stderr}")
 
             check_cmd = f"dar -n -l {shlex.quote(archive_arg)} -Q"
             check_process = subprocess.Popen(
@@ -600,18 +595,20 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                 else:
                     raise RuntimeError("Archiv-Einlesen vom Benutzer abgebrochen.")
 
+            # Nutzung des DarTapeManagers im Tape-Modus
             if getattr(self, 'is_tape_active', False):
-                cmd_add = [dar_mgr_cmd, "-B", self.current_dmd_db, "-A", archive_arg]
+                from dar_tape_manager import DarTapeManager
+                manager = DarTapeManager(self.current_dmd_db, dar_mgr_bin)
 
-                add_res = subprocess.run(cmd_add, capture_output=True, text=True, env={"LC_ALL": "C"})
-                if add_res.returncode != 0:
-                    raise RuntimeError(
-                        f"Katalog konnte nicht in dar_manager geladen werden.\n\n"
-                        f"Fehlermeldung von dar_manager:\n{add_res.stderr or add_res.stdout}"
-                    )
+                if not manager.create_database():
+                    raise RuntimeError("Fehler beim Erstellen der DMD-Datenbank.")
+
+                if not manager.add_archive(archive_arg, self.archive_password):
+                    raise RuntimeError("Katalog konnte nicht in dar_manager geladen werden.")
 
                 self._append_log_threadsafe("[System]: dar_manager-Datenbank erfolgreich erstellt.")
 
+            # Lokales Einlesen über den Standard-Parser (unberührt für normale Archive)
             entries, warning = run_dar_listing(
                 path,
                 password_callback=password_callback,
@@ -622,6 +619,98 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
         except Exception as exc:
             GLib.idle_add(self._load_finished, path, None, "", str(exc))
+
+    def _extract_worker(self, destination, paths_to_extract, restore_ownership, total_expected_files):
+        try:
+            # 1. TAPE-MODUS (über DarTapeManager)
+            if getattr(self, 'is_tape_active', False) and self.current_dmd_db:
+                dar_mgr_bin = get_dar_manager_executable() or "dar_manager"
+                from dar_tape_manager import DarTapeManager
+                manager = DarTapeManager(self.current_dmd_db, dar_mgr_bin)
+
+                success = manager.restore_files(
+                    target_dir=destination,
+                    password=self.archive_password,
+                    file_patterns=None if paths_to_extract == [""] else paths_to_extract,
+                    restore_ownership=restore_ownership
+                )
+
+                if success:
+                    GLib.idle_add(self._extract_finished, "Extraktion erfolgreich abgeschlossen.")
+                else:
+                    GLib.idle_add(self._force_show_log)
+                    GLib.idle_add(self._extract_finished, "Extraktion via dar_manager fehlgeschlagen.")
+                return
+
+            # 2. STANDARDMODUS (Direktes DAR - vollkommen unberührt)
+            else:
+                clean_archive = normalize_archive_argument(self.current_archive)
+                cmd = ["dar", "-x", clean_archive, "-R", destination, "-w"]
+
+                if not restore_ownership:
+                    cmd.append("-O")
+
+                if self.archive_password:
+                    cmd.extend(["-K", f"gzip:{self.archive_password}"])
+
+                if paths_to_extract != [""]:
+                    for p in paths_to_extract:
+                        if p:
+                            cmd.extend(["-g", p])
+
+            sudo_pwd = None
+            if restore_ownership:
+                sudo_pwd = self._prompt_user_interactive_queue(
+                    "Für die Wiederherstellung der Dateirechte wird Ihr sudo-Passwort benötigt:"
+                )
+                if not sudo_pwd:
+                    self._append_log_threadsafe("[System]: Extraktion abgebrochen (kein Sudo-Passwort).")
+                    GLib.idle_add(self._extract_finished, "Extraktion abgebrochen")
+                    return
+
+                cmd = ["sudo", "-S"] + cmd
+
+            self._append_log_threadsafe(f"[Executing Command]: {' '.join(cmd)}")
+
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env={"LC_ALL": "C", "LANG": "C"}
+            )
+
+            if restore_ownership and sudo_pwd:
+                process.stdin.write(f"{sudo_pwd}\n")
+                process.stdin.flush()
+
+            file_counter = 0
+
+            while True:
+                line = process.stdout.readline()
+                if not line and process.poll() is not None:
+                    break
+
+                if line:
+                    line_str = line.strip()
+                    self._append_log_threadsafe(line_str)
+                    if any(kw in line_str for kw in ["Extracting", "Restoring", "Entpacke", "Wiederherstellen", "[OK]"]):
+                        file_counter += 1
+                        GLib.idle_add(self._update_progress_ui, file_counter, total_expected_files)
+
+            returncode = process.wait()
+            if returncode == 0:
+                GLib.idle_add(self._extract_finished, "Extraktion erfolgreich abgeschlossen.")
+            else:
+                GLib.idle_add(self._force_show_log)
+                GLib.idle_add(self._extract_finished, f"Extraktion fehlgeschlagen (Exit-Code {returncode}).")
+
+        except Exception as e:
+            GLib.idle_add(self._force_show_log)
+            self._append_log_threadsafe(f"[Fehler bei Extraktion]: {e}")
+            GLib.idle_add(self._extract_finished, f"Fehler: {e}")
 
     def _load_finished(self, path, entries, warning, error):
         self.loading = False
@@ -891,36 +980,54 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
     def _extract_worker(self, destination, paths_to_extract, restore_ownership, total_expected_files):
         try:
-            dar_mgr_bin = get_dar_manager_executable()
+            cmd = []
 
+            # ==========================================
+            # 1. TAPE-MODUS (LTFS / dar_manager)
+            # ==========================================
             if getattr(self, 'is_tape_active', False) and self.current_dmd_db:
-                dar_mgr_cmd = dar_mgr_bin or "dar_manager"
-                cmd = [dar_mgr_cmd, "-B", self.current_dmd_db, "-R", destination, "-w"]
+                dar_mgr_bin = get_dar_manager_executable() or "dar_manager"
+
+                cmd = [dar_mgr_bin, "-N", "-B", self.current_dmd_db]
+
+                # Zielverzeichnis via -o an dar übergeben
+                cmd.extend(["-o", f"-R {destination}"])
 
                 if not restore_ownership:
-                    cmd.append("-O")
+                    cmd.extend(["-o", "-O"])
 
-                if paths_to_extract == [""]:
-                    cmd.append("-r")
-                else:
+                if self.archive_password:
+                    cmd.extend(["-o", f"-K pass:{self.archive_password}"])
+
+                # Extraktions-Befehl (-r)
+                cmd.append("-r")
+
+                # Dateiauswahl an -r anhängen (muss relativ sein, ohne führenden Slash)
+                if paths_to_extract != [""]:
                     for p in paths_to_extract:
-                        if p:
-                            cmd.extend(["-r", p])
+                        clean_path = p.lstrip("/")
+                        if clean_path:
+                            cmd.append(clean_path)
+
+            # ==========================================
+            # 2. STANDARDMODUS (Direktes DAR)
+            # ==========================================
             else:
                 clean_archive = normalize_archive_argument(self.current_archive)
-                cmd = ["dar", "-n", "-x", clean_archive, "-R", destination, "-w"]
+                cmd = ["dar", "-x", clean_archive, "-R", destination, "-w"]
 
                 if not restore_ownership:
                     cmd.append("-O")
 
                 if self.archive_password:
-                    cmd.extend(["-K", self.archive_password])
+                    cmd.extend(["-K", f"pass:{self.archive_password}"])
 
                 if paths_to_extract != [""]:
                     for p in paths_to_extract:
                         if p:
                             cmd.extend(["-g", p])
 
+            # Rechte-Wiederherstellung mit sudo
             sudo_pwd = None
             if restore_ownership:
                 sudo_pwd = self._prompt_user_interactive_queue(
@@ -961,6 +1068,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                     print(f"[DAR OUT]: {line_str}", flush=True)
                     self._append_log_threadsafe(line_str)
 
+                    # Interaktive Prompts abfangen (Passwort, Slice-Wechsel etc.)
                     if any(prompt in line_str for prompt in [
                         "Passphrase", "Password", "Enter key", "stelle die Slice", "Please enter slice",
                         "Continue?", "overwrite", "Press enter", "Entscheidung:"
