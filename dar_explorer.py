@@ -32,6 +32,16 @@ def get_dar_manager_executable() -> str | None:
         return "/usr/local/bin/dar_manager"
     return None
 
+def get_dar_executable() -> str:
+    """Sucht nach dem dar-Befehl im System-PATH."""
+    found = shutil.which("dar")
+    if found:
+        return found
+    for path in ["/usr/bin/dar", "/usr/local/bin/dar"]:
+        if os.path.exists(path) and os.access(path, os.X_OK):
+            return path
+    return "dar"
+
 
 class DarNode(GObject.Object):
     def __init__(
@@ -1013,14 +1023,15 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             # 2. STANDARDMODUS (Direktes DAR)
             # ==========================================
             else:
+                dar_bin = get_dar_executable()
                 clean_archive = normalize_archive_argument(self.current_archive)
-                cmd = ["dar", "-x", clean_archive, "-R", destination, "-w"]
+                cmd = [dar_bin, "-x", clean_archive, "-R", destination, "-w"]
 
                 if not restore_ownership:
                     cmd.append("-O")
 
                 if self.archive_password:
-                    cmd.extend(["-K", f"pass:{self.archive_password}"])
+                    cmd.extend(["-K", self.archive_password])
 
                 if paths_to_extract != [""]:
                     for p in paths_to_extract:
