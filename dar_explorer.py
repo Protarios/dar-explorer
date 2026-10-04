@@ -599,15 +599,21 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                 for line in iter(check_process.stdout.readline, ''):
                     clean_line = line.strip()
                     if clean_line:
+                        # Wir sammeln die Zeilen nur im Hintergrund,
+                        # ohne sie direkt einzeln in die GUI zu schreiben (kein Lag!)
                         check_output_lines.append(clean_line)
-                        self._append_log_threadsafe(f"[dar]: {clean_line}")
 
             check_process.wait()
             returncode = check_process.returncode
 
             if returncode != 0:
+                # Nur im Fehlerfall (z. B. Passwort fehlt) öffnen wir das Log
+                # und zeigen die gesammelten Ausgaben an:
                 GLib.idle_add(self._force_show_log)
-                self._append_log_threadsafe("[System]: Archiv geschützt oder erfordert Passwort...")
+                self._append_log_threadsafe("[System]: Archiv geschützt oder erfordert Passwort / Fehler aufgetreten:")
+                for line in check_output_lines:
+                    self._append_log_threadsafe(f"[dar]: {line}")
+
                 pwd = self._prompt_user_interactive_queue("Bitte gib das Passwort für das Archiv ein:")
                 if pwd is not None:
                     self.archive_password = pwd
