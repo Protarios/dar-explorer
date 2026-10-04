@@ -580,6 +580,8 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             os.makedirs(tmp_dir, exist_ok=True, mode=0o700)
             self.current_dmd_db = os.path.join(tmp_dir, "tape_archive.dmd")
 
+            dar_mgr_bin = get_dar_manager_executable()
+
             dar_bin = get_dar_executable()
             check_cmd = [dar_bin, "-n", "-l", archive_arg, "-Q", "-N"]
             self._append_log_threadsafe(f"[EXEC]: {' '.join(check_cmd)}")
@@ -625,10 +627,12 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                 from dar_tape_manager import DarTapeManager
                 manager = DarTapeManager(self.current_dmd_db, dar_mgr_bin)
 
-                if not manager.create_database():
+                # Hier den Callback übergeben!
+                if not manager.create_database(line_callback=self._append_log_threadsafe):
                     raise RuntimeError("Fehler beim Erstellen der DMD-Datenbank.")
 
-                if not manager.add_archive(archive_arg, self.archive_password):
+                # Hier ebenfalls den Callback übergeben!
+                if not manager.add_archive(archive_arg, self.archive_password, line_callback=self._append_log_threadsafe):
                     raise RuntimeError("Katalog konnte nicht in dar_manager geladen werden.")
 
                 self._append_log_threadsafe("[System]: dar_manager-Datenbank erfolgreich erstellt.")
@@ -648,16 +652,19 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
     def _extract_worker(self, destination, paths_to_extract, restore_ownership, total_expected_files):
         try:
             # 1. TAPE-MODUS (über DarTapeManager)
+            # 1. TAPE-MODUS (über DarTapeManager)
             if getattr(self, 'is_tape_active', False) and self.current_dmd_db:
                 dar_mgr_bin = get_dar_manager_executable() or "dar_manager"
                 from dar_tape_manager import DarTapeManager
                 manager = DarTapeManager(self.current_dmd_db, dar_mgr_bin)
 
+                # Auch hier den Callback für die Wiederherstellung mitgeben!
                 success = manager.restore_files(
                     target_dir=destination,
                     password=self.archive_password,
                     file_patterns=None if paths_to_extract == [""] else paths_to_extract,
-                    restore_ownership=restore_ownership
+                    restore_ownership=restore_ownership,
+                    line_callback=self._append_log_threadsafe
                 )
 
                 if success:
@@ -676,7 +683,8 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                     cmd.append("-O")
 
                 if self.archive_password:
-                    cmd.extend(["-K", f"gzip:{self.archive_password}"])
+                    # Korrektes Übergeben des Passworts für dar (ohne falsches 'gzip:')
+                    cmd.extend(["-K", self.archive_password])
 
                 if paths_to_extract != [""]:
                     for p in paths_to_extract:

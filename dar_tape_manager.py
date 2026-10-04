@@ -82,16 +82,37 @@ class DarTapeManager:
                 line_callback(f"[FEHLER] Pexpect Exception: {e}")
             return False
 
-    def create_database(self) -> bool:
+    def create_database(self, line_callback: Optional[Callable[[str], None]] = None) -> bool:
         """Erstellt eine neue, leere .dmd-Datenbankdatei."""
         self.dmd_path.parent.mkdir(parents=True, exist_ok=True)
         cmd = [self.bin, "-N", "-C", str(self.dmd_path)]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, env={"LC_ALL": "C", "LANG": "C"})
-        if result.returncode != 0:
-            print(f"[ERROR] Fehler beim Erstellen der DB: {result.stderr or result.stdout}")
+        if line_callback:
+            line_callback(f"[EXEC]: {' '.join(cmd)}")
+
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+                env={"LC_ALL": "C", "LANG": "C"}
+            )
+
+            if process.stdout:
+                for line in iter(process.stdout.readline, ''):
+                    clean = line.strip()
+                    if clean and line_callback:
+                        line_callback(f"[dar_manager]: {clean}")
+
+            process.wait()
+            return process.returncode == 0
+        except Exception as e:
+            if line_callback:
+                line_callback(f"[FEHLER]: Konnte Datenbank nicht erstellen: {e}")
             return False
-        return True
 
     def add_archive(self, archive_basename: str, password: Optional[str] = None, line_callback: Optional[Callable[[str], None]] = None) -> bool:
         """Fügt ein Band-Archiv zur DMD-Datenbank hinzu (vollständig pexpect-gesichert)."""
