@@ -996,13 +996,14 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             self.extract_btn.set_sensitive(False)
             return
 
-        # WICHTIG: Aus Katalogen kann nichts extrahiert werden!
+        # Für isolierte Kataloge erlauben wir die Extraktion nun über das echte Archiv!
         if getattr(self, 'is_current_catalog', False):
-            self.extract_btn.set_label("Aus Katalog nicht extrahierbar")
-            self.extract_btn.set_sensitive(False)
-            self.extract_btn.set_tooltip_text("Isolierte Kataloge enthalten nur Metadaten und keine Dateiinhalte.")
-            return
+            self.extract_btn.set_label("Aus Katalog extrahieren...")
+            self.extract_btn.set_sensitive(True)
+            self.extract_btn.set_tooltip_text("Extrahiert Dateien mithilfe des echten Archivs und dieses Katalogs.")
         else:
+            self.extract_btn.set_label("Extrahieren") # Oder deinen Standard-Button-Text
+            self.extract_btn.set_sensitive(True)
             self.extract_btn.set_tooltip_text(None)
 
         # 1. Rechte Seite (explizite Dateiauswahl) hat Vorrang
@@ -1080,6 +1081,164 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         if self.current_archive:
             self.load_archive(self.current_archive)
 
+    def _execute_extraction_with_catalog_reference(self, real_archive_arg, catalog_path, dest_dir, paths_to_extract, archive_password=None, restore_ownership=False):
+        """Führt die Extraktion aus und berücksichtigt -O (Rechte ignorieren) wenn gewünscht."""
+        self.status_label.set_text("Extrahiere Daten mit Katalog-Referenz...")
+        self.progress.set_visible(True)
+        self.progress.pulse()
+
+        def worker():
+            try:
+                dar_bin = get_dar_executable()
+
+                p_cat = Path(catalog_path)
+                cat_filename = p_cat.name
+                cat_clean_name = re.sub(r'\.\d+\.dar$', '', cat_filename)
+                cat_clean_name = re.sub(r'\.dar$', '', cat_clean_name)
+                catalog_arg = str(p_cat.parent / cat_clean_name)
+
+                catalog_pwd = getattr(self, 'archive_password', None)
+                current_archive_pwd = archive_password
+
+                for path in paths_to_extract:
+                    cmd_args = [dar_bin]
+
+                    if catalog_pwd:
+                        cmd_args.extend(["-J", catalog_pwd])
+
+                    if current_archive_pwd:
+                        cmd_args.extend(["-K", current_archive_pwd])
+
+                    cmd_args.extend([
+                        "-x", real_archive_arg,
+                        "-A", catalog_arg,
+                        "-R", str(dest_dir),
+                        "-Q"
+                    ])
+
+                    # WICHTIG: Wenn KEINE Originalrechte erzwungen werden, -O (ignore ownership) übergeben
+                    if not restore_ownership:
+                        cmd_args.append("-O")
+
+                    if path:
+                        cmd_args.extend(["-g", path])
+
+                    self._append_log_threadsafe(f"[EXEC Extraktion]: {' '.join(cmd_args)}")
+
+                    env = os.environ.copy()
+                    env["LC_ALL"] = "C"
+                    env["LANG"] = "C"
+
+                    process = subprocess.run(
+                        cmd_args,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        env=env
+                    )
+
+                    output_text = process.stdout or ""
+                    if output_text:
+                        for line in output_text.splitlines():
+                            cleaned = line.strip()
+                            if cleaned:
+                                self._append_log_threadsafe(f"[dar extract]: {cleaned}")
+
+                    # --- ENCRYPTION DETECTOR & RETRY FÜR DAS ARCHIV (-K) ---
+                    if "secu_string" in output_text or process.returncode != 0:
+                        if not current_archive_pwd:
+                            self._append_log_threadsafe("[System]: Das echte Archiv benötigt ein Passwort. Öffne Passworteingabe...")
+
+                            def prompt_in_main_thread():
+                                dialog = Gtk.Dialog(title="Passwort für das Datenarchiv erforderlich", transient_for=self, modal=True)
+                                dialog.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
+                                dialog.add_button("Extrahieren", Gtk.ResponseType.OK)
+
+                                content_area = dialog.get_content_area()
+                                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+                                box.set_margin_top(15)
+                                box.set_margin_bottom(15)
+                                box.set_margin_start(15)
+                                box.set_margin_end(15)
+
+                                label = Gtk.Label(label="Das echte Datenarchiv (Ziel) ist verschlüsselt.\nBitte gib das Passwort ein:")
+                                box.append(label)
+
+                                entry = Gtk.Entry()
+                                entry.set_visibility(False)
+                                box.append(entry)
+                                content_area.append(box)
+
+                                def on_response(dlg, response_id):
+                                    if response_id == Gtk.ResponseType.OK:
+                                        entered_pwd = entry.get_text()
+                                        dlg.destroy()
+                                        self._execute_extraction_with_catalog_reference(
+                                            real_archive_arg, catalog_path, dest_dir, paths_to_extract, archive_password=entered_pwd, restore_ownership=restore_ownership
+                                        )
+                                    else:
+                                        dlg.destroy()
+                                        self.progress.set_visible(False)
+                                        self.status_label.set_text("Extraktion abgebrochen.")
+
+                                dialog.connect("response", on_response)
+                                dialog.present()
+
+                            GLib.idle_add(prompt_in_main_thread)
+                            return
+                        else:
+                            GLib.idle_add(lambda: self.show_error_dialog("Fehler bei der Extraktion (Falsches Archiv-Passwort?). Siehe Log."))
+                            return
+
+                self._append_log_threadsafe("[System]: Extraktion mit Katalog-Referenz erfolgreich abgeschlossen.")
+                GLib.idle_add(lambda: self.show_info_dialog("Extraktion erfolgreich beendet!"))
+
+            except Exception as e:
+                self._append_log_threadsafe(f"[Fehler Extraktion]: {e}")
+                GLib.idle_add(lambda: self.show_error_dialog(f"Ausnahmefehler: {e}"))
+            finally:
+                if not archive_password:
+                    GLib.idle_add(lambda: self.progress.set_visible(False))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+    def _prompt_for_extraction_password_and_retry(self, real_archive_arg, catalog_path, dest_dir, paths_to_extract):
+        """Öffnet einen GTK-Dialog zur Passworteingabe und wiederholt die Extraktion."""
+        dialog = Gtk.Dialog(title="Passwort erforderlich", transient_for=self, modal=True)
+        dialog.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Extrahieren", Gtk.ResponseType.OK)
+
+        content_area = dialog.get_content_area()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(15)
+        box.set_margin_bottom(15)
+        box.set_margin_start(15)
+        box.set_margin_end(15)
+
+        label = Gtk.Label(label="Das Archiv oder der Katalog ist verschlüsselt.\nBitte gib das Passwort ein:")
+        box.append(label)
+
+        entry = Gtk.Entry()
+        entry.set_visibility(False)  # Passwort-Maskierung (Sternchen)
+        box.append(entry)
+        content_area.append(box)
+
+        def on_response(dlg, response_id):
+            if response_id == Gtk.ResponseType.OK:
+                pwd = entry.get_text()
+                self.archive_password = pwd  # Fürs nächste Mal speichern
+                dlg.destroy()
+                # Extraktion mit dem eingegebenen Passwort neu starten
+                self._execute_extraction_with_catalog_reference(real_archive_arg, catalog_path, dest_dir, paths_to_extract, forced_password=pwd)
+            else:
+                dlg.destroy()
+                self.progress.set_visible(False)
+                self.status_label.set_text("Extraktion abgebrochen.")
+
+        dialog.connect("response", on_response)
+        dialog.present()
+
     def on_extract_clicked(self, _button):
         paths_to_extract = []
 
@@ -1108,20 +1267,57 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             self._append_log_threadsafe("Keine Dateien zur Extraktion ausgewählt.")
             return
 
-        dialog = Gtk.FileDialog(title="Extraktions-Ziel wählen")
+        dialog = Gtk.FileDialog(title="Zielverzeichnis für Extraktion wählen")
 
         def on_folder_picked(dialog_obj, result):
             try:
                 folder = dialog_obj.select_folder_finish(result)
                 if folder:
                     destination = folder.get_path()
-                    self._ask_for_permissions_mode(destination, paths_to_extract)
+
+                    is_isolated_catalog = getattr(self, 'is_current_catalog', False)
+                    if is_isolated_catalog:
+                        file_dialog = Gtk.FileDialog(title="Echtes Archiv (Slice) auswählen")
+
+                        def on_file_picked(file_dialog_obj, file_result):
+                            try:
+                                file_obj = file_dialog_obj.open_finish(file_result)
+                                if file_obj:
+                                    file_path = Path(file_obj.get_path())
+
+                                    filename = file_path.name
+                                    clean_base_name = re.sub(r'\.\d+\.dar$', '', filename)
+                                    clean_base_name = re.sub(r'\.dar$', '', clean_base_name)
+                                    real_archive_arg = str(file_path.parent / clean_base_name)
+
+                                    catalog_path = None
+                                    for key, val in self.__dict__.items():
+                                        if isinstance(val, (str, Path)) and str(val).endswith(('.dar', 'katalog', 'catalog')) and Path(val).exists():
+                                            catalog_path = str(val)
+                                            break
+
+                                    if not catalog_path:
+                                        catalog_path = getattr(self, 'current_file', None) or getattr(self, 'current_archive_path', None) or "/tmp/dar-explorer/catalogs/"
+
+                                    self._append_log_threadsafe(f"[Debug]: Nutze Katalog-Referenz: {catalog_path}")
+
+                                    # WICHTIG: Auch beim Katalog-Weg fragen wir jetzt nach den Berechtigungen!
+                                    self._ask_for_permissions_mode(destination, paths_to_extract, real_archive_arg, catalog_path)
+
+                            except Exception as e:
+                                self._append_log_threadsafe(f"Fehler bei der Dateiauswahl: {e}")
+
+                        file_dialog.open(self, None, on_file_picked)
+                    else:
+                        # Normaler Weg
+                        self._ask_for_permissions_mode(destination, paths_to_extract)
+
             except Exception as e:
                 self._append_log_threadsafe(f"Fehler bei der Ordnerauswahl: {e}")
 
         dialog.select_folder(self, None, on_folder_picked)
 
-    def _ask_for_permissions_mode(self, destination, paths_to_extract):
+    def _ask_for_permissions_mode(self, destination, paths_to_extract, real_archive_arg=None, catalog_path=None):
         window = Gtk.Window(title="Berechtigungen wiederherstellen?", transient_for=self, modal=True)
         window.set_default_size(450, -1)
 
@@ -1160,7 +1356,14 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                 return
 
             restore_ownership = (action_type == "keep")
-            self._start_extraction_thread(destination, paths_to_extract, restore_ownership)
+
+            # Unterscheiden, ob Katalog-Modus oder normaler Modus
+            if real_archive_arg and catalog_path:
+                self._execute_extraction_with_catalog_reference(
+                    real_archive_arg, catalog_path, destination, paths_to_extract, restore_ownership=restore_ownership
+                )
+            else:
+                self._start_extraction_thread(destination, paths_to_extract, restore_ownership)
 
         btn_cancel.connect("clicked", on_choice_made, "cancel")
         btn_ignore.connect("clicked", on_choice_made, "ignore")

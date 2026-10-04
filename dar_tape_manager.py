@@ -20,8 +20,8 @@ class DarTapeManager:
 
     def _run_with_pexpect(self, cmd: List[str], password: Optional[str] = None, line_callback: Optional[Callable[[str], None]] = None) -> bool:
         """
-        Führt einen Befehl über pexpect aus, fängt Passwort-Prompts im Speicher ab und
-        leitet die Ausgabe Zeile für Zeile an das Callback weiter, ohne Passwörter zu speichern.
+        Führt einen Befehl über pexpect aus, streamt die Ausgabe sofort live
+        und fängt Passwort-Prompts ab, falls welche auftauchen.
         """
         cmd_str = " ".join(cmd)
         if line_callback:
@@ -36,41 +36,52 @@ class DarTapeManager:
                 env={"LC_ALL": "C", "LANG": "C"}
             )
 
-            password_patterns = [
+            # Muster für Prompts oder normalen Zeilenumbruch / Ende
+            patterns = [
                 r"requires a password:",
                 r"password:",
                 r"Enter password:",
-                pexpect.TIMEOUT,
+                r"\r?\n",         # Jede normale Zeile
                 pexpect.EOF
             ]
 
+            buffer = ""
             while True:
-                index = child.expect(password_patterns, timeout=120)
+                index = child.expect(patterns, timeout=120)
 
+                # Was vor dem Treffer ausgegeben wurde
                 if child.before:
-                    for line in child.before.splitlines():
-                        cleaned = line.strip()
-                        if cleaned and line_callback:
-                            line_callback(f"[dar_manager]: {cleaned}")
+                    buffer += child.before
 
-                if index in [0, 1, 2]:
+                if index == 3:  # Zeilenumbruch gefunden -> Zeile ausgeben
+                    if "\n" in buffer:
+                        lines = buffer.split("\n")
+                        for line in lines[:-1]:
+                            cleaned = line.strip()
+                            if cleaned and line_callback:
+                                line_callback(f"[dar_manager]: {cleaned}")
+                        buffer = lines[-1]
+                elif index in [0, 1, 2]:  # Passwort-Prompt erkannt
                     if password:
-                        # Passwort wird rein im Speicher an den Prozess übergeben
                         child.sendline(password)
+                        if line_callback:
+                            line_callback("[dar_manager]: [Passwort automatisch übergeben]")
                     else:
                         child.close(force=True)
                         if line_callback:
                             line_callback("[FEHLER] dar/dar_manager verlangt ein Passwort, aber keines übergeben.")
                         return False
-                elif index == 3:
-                    if line_callback:
-                        line_callback("[FEHLER] Zeitüberschreitung bei der Befehlsausführung.")
-                    child.close(force=True)
-                    return False
-                elif index == 4:
+                elif index == 4:  # EOF (Prozess beendet)
+                    if buffer.strip():
+                        for line in buffer.splitlines():
+                            cleaned = line.strip()
+                            if cleaned and line_callback:
+                                line_callback(f"[dar_manager]: {cleaned}")
                     break
 
             child.wait()
+            return child.exitstatus == 0
+
             return child.exitstatus == 0
 
         except Exception as e:
@@ -123,7 +134,7 @@ class DarTapeManager:
         cmd = [self.bin, "-B", str(self.dmd_path), "-A", archive_basename]
         return self._run_with_pexpect(cmd, password=password, line_callback=line_callback)
 
-    def restore_files(
+def restore_files(
         self,
         target_dir: str,
         password: Optional[str] = None,
@@ -135,10 +146,15 @@ class DarTapeManager:
         Path(target_dir).mkdir(parents=True, exist_ok=True)
 
         cmd = [self.bin, "-N", "-B", str(self.dmd_path)]
-        cmd.extend(["-o", f"-R {target_dir}"])
+
+        # Jedes dar-Argument sauber über ein eigenes -o übergeben
+        cmd.extend(["-o", "-R", "-o", target_dir])
 
         if not restore_ownership:
             cmd.extend(["-o", "-O"])
+
+        if password:
+            cmd.extend(["-o", "-K", "-o", password])
 
         cmd.append("-r")
 
