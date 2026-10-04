@@ -660,7 +660,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                 self._create_catalog_interactive(
                     path,
                     str(catalog_target),
-                    lambda tape_mode, cat_path: execute_load(cat_path, is_cat=True)
+                    lambda cat_path: execute_load(cat_path, is_cat=True) if cat_path else None
                 )
 
             btn_cancel.connect("clicked", on_action, False)
@@ -722,15 +722,14 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         result_queue.get()
 
     def _create_catalog_interactive(self, archive_path, catalog_target, callback):
-        """Erzeugt einen isolierten Katalog und bricht bei Slice-Fehlern sofort und fehlerfrei ab."""
+        """Erzeugt einen isolierten Katalog via subprocess, da -J das Passwort direkt frisst."""
         self.status_label.set_text("Erstelle isolierten Katalog...")
         self.progress.set_visible(True)
         self.progress.pulse()
 
         def worker():
-            import pexpect
             try:
-                p_obj = Path(archive_path)
+                p_obj = Path(archive_path).resolve()
                 clean_name = re.sub(r'\.\d+\.dar$', '', p_obj.name)
                 archive_arg = str(p_obj.parent / clean_name)
 
@@ -739,79 +738,51 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                 catalog_target_path = cache_dir / f"{clean_name}.dar"
 
                 dar_bin = get_dar_executable()
-                cmd_args = ["-C", str(catalog_target_path), "-A", archive_arg, "-Q", "-N"]
 
+                # Exakt die Syntax, die im Terminal funktioniert:
+                cmd_args = [dar_bin, "-C", str(catalog_target_path), "-A", archive_arg, "-Q"]
                 if self.archive_password:
-                    cmd_args.extend(["-K", self.archive_password])
+                    cmd_args.extend(["-J", self.archive_password])
 
-                full_cmd = f"{dar_bin} " + " ".join(cmd_args)
-                self._append_log_threadsafe(f"[EXEC]: {full_cmd}")
+                self._append_log_threadsafe(f"[EXEC]: {' '.join(cmd_args)}")
 
-                child = pexpect.spawn(dar_bin, cmd_args, encoding='utf-8', timeout=None)
-                fatal_error_occurred = False
+                env = os.environ.copy()
+                env["LC_ALL"] = "C"
+                env["LANG"] = "C"
 
-                while child.isalive() and not fatal_error_occurred:
-                    index = child.expect([
-                        r'is not present',           # 0: Fehlendes Slice (Fatal)
-                        r'User refused to continue', # 1: Dar Abbruch (Fatal)
-                        r'[pP]assword\s*:',          # 2: Passwort
-                        r'[pP]asswort\s*:',          # 3: Passwort
-                        r'requires a password',      # 4: Passwort
-                        r'\r?\n',                    # 5: Normale Zeile
-                        pexpect.EOF,                 # 6: Ende
-                        pexpect.TIMEOUT              # 7: Timeout
-                    ], timeout=1.0)
+                process = subprocess.run(
+                    cmd_args,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=env
+                )
 
-                    output = (child.before or "") + (child.after or "")
-                    clean_line = output.strip()
+                if process.stdout:
+                    for line in process.stdout.splitlines():
+                        cleaned = line.strip()
+                        if cleaned:
+                            self._append_log_threadsafe(f"[dar]: {cleaned}")
 
-                    if index in [0, 1]:
-                        # FATALER FEHLER: Sofort stoppen
-                        fatal_error_occurred = True
-                        try:
-                            child.terminate(force=True)
-                            child.close(force=True)
-                        except Exception:
-                            pass
-
-                        if clean_line:
-                            self._append_log_threadsafe(clean_line)
-
-                        # Das Pop-up und den Callback komplett an den Hauptthread übergeben (kein Blockieren!)
-                        GLib.idle_add(lambda: self._show_fatal_slice_error(clean_line, callback))
-                        return
-
-                    elif index in [2, 3, 4]:
-                        if fatal_error_occurred:
-                            break
-
-                        if clean_line:
-                            self._append_log_threadsafe(clean_line)
-
-                        if self.archive_password:
-                            pwd = self.archive_password
-                        else:
-                            pwd = self._prompt_user_interactive_queue(clean_line or "Passwort erforderlich:")
-                            if pwd:
-                                self.archive_password = pwd
-
+                if process.returncode == 0:
+                    self._append_log_threadsafe("[System]: Isolierter Katalog erfolgreich erstellt.")
+                    GLib.idle_add(lambda: callback(str(catalog_target_path)))
+                else:
+                    # Falls es fehlschlägt (z.B. falsches Passwort), versuchen wir es über die GUI zu erfragen
+                    error_output = process.stdout.lower() if process.stdout else ""
+                    if any(kw in error_output for kw in ["password", "secu_string", "krypt", "auth", "encryption"]):
+                        pwd = self._prompt_user_interactive_queue("Das Passwort ist falsch oder erforderlich:")
                         if pwd is not None:
-                            child.sendline(pwd)
-                        else:
-                            child.close(force=True)
-                            fatal_error_occurred = True
-                            GLib.idle_add(lambda: callback(True, "USER_CANCELLED"))
+                            self.archive_password = pwd
+                            # Rekursiver Aufruf mit neuem Passwort
+                            GLib.idle_add(lambda: self._create_catalog_interactive(archive_path, catalog_target, callback))
                             return
-                    elif index == 5:
-                        if clean_line:
-                            self._append_log_threadsafe(clean_line)
-                    elif index >= 6:
-                        break
+
+                    GLib.idle_add(lambda: callback(None))
 
             except Exception as e:
-                err_str = str(e)
-                self._append_log_threadsafe(f"[Fehler Katalog-Erstellung]: {err_str}")
-                GLib.idle_add(lambda: callback(True, "EXCEPTION"))
+                self._append_log_threadsafe(f"[Fehler Katalog-Erstellung]: {e}")
+                GLib.idle_add(lambda: callback(None))
 
         threading.Thread(target=worker, daemon=True).start()
 
