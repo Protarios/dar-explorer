@@ -20,14 +20,14 @@ class DarTapeManager:
 
     def _run_with_pexpect(self, cmd: List[str], password: Optional[str] = None, line_callback: Optional[Callable[[str], None]] = None) -> bool:
         """
-        Führt einen Befehl über pexpect aus, fängt Passwort-Prompts ab und
-        leitet die Ausgabe Zeile für Zeile an das Callback weiter.
+        Führt einen Befehl über pexpect aus, fängt Passwort-Prompts im Speicher ab und
+        leitet die Ausgabe Zeile für Zeile an das Callback weiter, ohne Passwörter zu speichern.
         """
         cmd_str = " ".join(cmd)
-        print(f"[DEBUG-PEXPECT] Executing: {cmd_str}")
+        if line_callback:
+            line_callback(f"[EXEC]: {cmd_str}")
 
         try:
-            # Spawn mit pexpect
             child = pexpect.spawn(
                 cmd[0],
                 cmd[1:],
@@ -36,7 +36,6 @@ class DarTapeManager:
                 env={"LC_ALL": "C", "LANG": "C"}
             )
 
-            # Muster, nach denen dar/dar_manager typischerweise nach einem Passwort fragen
             password_patterns = [
                 r"requires a password:",
                 r"password:",
@@ -46,32 +45,29 @@ class DarTapeManager:
             ]
 
             while True:
-                # Wir warten auf entweder Text, einen Passwort-Prompt, Timeout oder das Ende
                 index = child.expect(password_patterns, timeout=120)
 
-                # Gib eventuell aufgelaufene Ausgabe aus / ans Callback
                 if child.before:
                     for line in child.before.splitlines():
                         cleaned = line.strip()
                         if cleaned and line_callback:
-                            line_callback(cleaned)
+                            line_callback(f"[dar_manager]: {cleaned}")
 
-                if index == 0 or index == 1 or index == 2:
-                    # Passwort-Prompt erkannt!
+                if index in [0, 1, 2]:
                     if password:
+                        # Passwort wird rein im Speicher an den Prozess übergeben
                         child.sendline(password)
                     else:
-                        # Kein Passwort übergeben, aber eins gefordert -> abbrechen
                         child.close(force=True)
                         if line_callback:
                             line_callback("[FEHLER] dar/dar_manager verlangt ein Passwort, aber keines übergeben.")
                         return False
-                elif index == 3: # TIMEOUT
+                elif index == 3:
                     if line_callback:
                         line_callback("[FEHLER] Zeitüberschreitung bei der Befehlsausführung.")
                     child.close(force=True)
                     return False
-                elif index == 4: # EOF (Prozess beendet)
+                elif index == 4:
                     break
 
             child.wait()
@@ -83,8 +79,16 @@ class DarTapeManager:
             return False
 
     def create_database(self, line_callback: Optional[Callable[[str], None]] = None) -> bool:
-        """Erstellt eine neue, leere .dmd-Datenbankdatei."""
+        """Erstellt eine neue .dmd-Datenbank in der RAM-Disk."""
         self.dmd_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Falls eine alte Instanz in der RAM-Disk liegt, sauber entfernen
+        if self.dmd_path.exists():
+            try:
+                self.dmd_path.unlink()
+            except Exception:
+                pass
+
         cmd = [self.bin, "-N", "-C", str(self.dmd_path)]
 
         if line_callback:
@@ -111,11 +115,11 @@ class DarTapeManager:
             return process.returncode == 0
         except Exception as e:
             if line_callback:
-                line_callback(f"[FEHLER]: Konnte Datenbank nicht erstellen: {e}")
+                line_callback(f"[FEHLER]: Konnte Datenbank nicht in der RAM-Disk erstellen: {e}")
             return False
 
     def add_archive(self, archive_basename: str, password: Optional[str] = None, line_callback: Optional[Callable[[str], None]] = None) -> bool:
-        """Fügt ein Band-Archiv zur DMD-Datenbank hinzu (vollständig pexpect-gesichert)."""
+        """Fügt ein Band-Archiv zur DMD-Datenbank hinzu (vollständig pexpect-gesichert im RAM)."""
         cmd = [self.bin, "-B", str(self.dmd_path), "-A", archive_basename]
         return self._run_with_pexpect(cmd, password=password, line_callback=line_callback)
 
@@ -127,7 +131,7 @@ class DarTapeManager:
         restore_ownership: bool = True,
         line_callback: Optional[Callable[[str], None]] = None
     ) -> bool:
-        """Stellt Dateien über pexpect wieder her."""
+        """Stellt Dateien über pexpect aus der RAM-Disk-Datenbank wieder her."""
         Path(target_dir).mkdir(parents=True, exist_ok=True)
 
         cmd = [self.bin, "-N", "-B", str(self.dmd_path)]
