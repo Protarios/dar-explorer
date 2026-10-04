@@ -580,29 +580,34 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             os.makedirs(tmp_dir, exist_ok=True, mode=0o700)
             self.current_dmd_db = os.path.join(tmp_dir, "tape_archive.dmd")
 
-            dar_mgr_bin = get_dar_manager_executable()
-            if getattr(self, 'is_tape_active', False):
-                if not dar_mgr_bin:
-                    raise RuntimeError(
-                        "Das Systemwerkzeug 'dar_manager' ist nicht installiert.\n"
-                        "Bitte installieren Sie das Paket 'dar'."
-                    )
+            dar_bin = get_dar_executable()
+            check_cmd = [dar_bin, "-n", "-l", archive_arg, "-Q", "-N"]
+            self._append_log_threadsafe(f"[EXEC]: {' '.join(check_cmd)}")
 
-                if os.path.exists(self.current_dmd_db):
-                    try: os.remove(self.current_dmd_db)
-                    except Exception: pass
-
-            check_cmd = f"dar -n -l {shlex.quote(archive_arg)} -Q"
             check_process = subprocess.Popen(
-                check_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True,
+                check_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
                 env={"LC_ALL": "C", "LANG": "C"}
             )
-            _, check_stderr = check_process.communicate()
-            returncode = check_process.wait()
+
+            check_output_lines = []
+            if check_process.stdout:
+                for line in iter(check_process.stdout.readline, ''):
+                    clean_line = line.strip()
+                    if clean_line:
+                        check_output_lines.append(clean_line)
+                        self._append_log_threadsafe(f"[dar]: {clean_line}")
+
+            check_process.wait()
+            returncode = check_process.returncode
 
             if returncode != 0:
                 GLib.idle_add(self._force_show_log)
-                GLib.idle_add(self._append_log, "[System]: Archiv geschützt oder erfordert Passwort...")
+                self._append_log_threadsafe("[System]: Archiv geschützt oder erfordert Passwort...")
                 pwd = self._prompt_user_interactive_queue("Bitte gib das Passwort für das Archiv ein:")
                 if pwd is not None:
                     self.archive_password = pwd

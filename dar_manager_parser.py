@@ -1,66 +1,133 @@
-#!/usr/bin/env python3
-"""
-DAR Explorer V2 - Schnittstelle für dar_manager-Abfragen.
-Liest registrierte Archive und extrahiert die Dateilisten aus der DMD-Datenbank.
-"""
-
-import subprocess
 import os
 import re
+import subprocess
+import tempfile
+from typing import Callable, Optional
 
-def get_registered_archives(db_path: str) -> list[dict]:
+def execute_dar_cmd(
+    cmd: list[str],
+    log_callback: Optional[Callable[[str], None]] = None
+) -> bool:
     """
-    Liest alle in der DMD-Datenbank registrierten Archive aus.
-    Gibt eine Liste von Dictionaries mit Nummer, Pfad und Basisname zurück.
+    Führt dar/dar_manager aus, kappt STDIN gegen Hänger, liest STDOUT/STDERR live
+    und leitet JEDE Ausgabe direkt an die GUI weiter.
     """
-    if not os.path.exists(db_path):
-        return []
-
-    cmd = ["dar_manager", "-B", db_path, "-l"]
     env = os.environ.copy()
     env["LC_ALL"] = "C"
+    env["PYTHONUNBUFFERED"] = "1"
+
+    # WICHTIG: Batch-Modus erzwingen, damit dar NIEMALS auf Konsoleneingaben wartet
+    if "dar" in cmd[0] and "-N" not in cmd:
+        cmd.append("-N")
 
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, env=env, check=True)
-        lines = res.stdout.splitlines()
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,  # Signalisiert dar sofort: Keine Tastatur vorhanden!
+            text=True,
+            bufsize=1,
+            env=env
+        )
 
-        archives = []
-        parsing_started = False
+        # STDOUT live in die GUI schreiben
+        if process.stdout:
+            for line in iter(process.stdout.readline, ''):
+                clean_line = line.strip()
+                if clean_line and log_callback:
+                    log_callback(f"[dar]: {clean_line}")
 
-        for line in lines:
-            if "archive #" in line.lower() or "---" in line:
-                parsing_started = True
-                continue
-            if not parsing_started:
-                continue
+        # Restliche STDERR-Fehler lesen und unzensiert in die GUI werfen
+        _, stderr_data = process.communicate()
+        if stderr_data and log_callback:
+            for err_line in stderr_data.splitlines():
+                if err_line.strip():
+                    log_callback(f"[dar FEHLER]: {err_line.strip()}")
 
-            # Zeilen-Format: " 1 | /path/to/archive | basename"
-            parts = [p.strip() for p in line.split("|")]
-            if len(parts) >= 3 and parts[0].isdigit():
-                archives.append({
-                    "id": int(parts[0]),
-                    "path": parts[1],
-                    "basename": parts[2]
-                })
-        return archives
+        return process.returncode == 0
+
     except Exception as e:
-        print(f"[Manager-Parser] Fehler beim Auslesen der Archive: {e}")
-        return []
+        if log_callback:
+            log_callback(f"[SYSTEM FEHLER]: Prozess konnte nicht gestartet werden: {e}")
+        return False
 
-def add_catalog_to_db(db_path: str, catalog_path: str, archive_original_name: str) -> bool:
-    """
-    Fügt einen isolierten Katalog der dar_manager-Datenbank hinzu.
-    Berechnet dabei das mathematische Raster für die Slice-Zuordnung.
-    """
-    # Regulären Basisnamen extrahieren
-    clean_base = re.sub(r"\.\d+\.dar$", "", os.path.basename(catalog_path))
-    clean_orig = re.sub(r"\.\d+\.dar$", "", archive_original_name)
 
-    # dar_manager -B <db> -A <katalog_basis> <original_name_im_lager>
-    cmd = ["dar_manager", "-B", db_path, "-A", catalog_path.replace(".1.dar", ""), clean_orig]
+import os
+import re
+import subprocess
+import tempfile
+from typing import Callable, Optional
+
+def add_catalog_to_db(
+    db_path: str,
+    slice_path: str,
+    archive_original_name: str,
+    password: str = None,
+    log_callback: Optional[Callable[[str], None]] = None
+) -> bool:
+    """
+    Fügt das Slice der DMD hinzu.
+    Führt STDOUT und STDERR zusammen und liest Ausgaben ungepuffert aus,
+    sodass Passwort-Abfragen und Fehler sofort live in der GUI sichtbar sind.
+    """
+    clean_catalog_base = re.sub(r"\.\d+\.dar$", "", slice_path)
+    clean_orig_base = re.sub(r"\.\d+\.dar$", "", archive_original_name)
+
+    cmd = [
+        "dar_manager",
+        "-B", db_path,
+        "-A", clean_catalog_base, clean_orig_base,
+        "-o", "-N"
+    ]
+
+    passfile_path = None
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
+    env["PYTHONUNBUFFERED"] = "1"
 
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except subprocess.CalledProcessError:
+        if password:
+            with tempfile.NamedTemporaryFile(mode="w", delete=False) as pf:
+                pf.write(f"{password}\n")
+                passfile_path = pf.name
+            cmd.extend(["-K", f"passfile:{passfile_path}"])
+
+        if log_callback:
+            log_callback(f"[System]: Starte dar_manager (Versuch mit Passfile: {bool(password)})...")
+
+        # stderr=subprocess.STDOUT führt Fehler & normale Ausgaben in EINEM Stream zusammen
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            bufsize=0,  # Komplett ungepuffert
+            env=env
+        )
+
+        # Liest Zeichen/Zeilen ungepuffert aus, damit nichts im Buffer hängen bleibt
+        if process.stdout:
+            while True:
+                line = process.stdout.readline()
+                if not line and process.poll() is not None:
+                    break
+                clean_line = line.strip()
+                if clean_line and log_callback:
+                    log_callback(f"[dar]: {clean_line}")
+
+        process.wait()
+        return process.returncode == 0
+
+    except Exception as e:
+        if log_callback:
+            log_callback(f"[FEHLER]: Prozess konnte nicht ausgeführt werden: {e}")
         return False
+
+    finally:
+        if passfile_path and os.path.exists(passfile_path):
+            try:
+                os.unlink(passfile_path)
+            except OSError:
+                pass
