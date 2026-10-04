@@ -363,6 +363,10 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         tree_view = Gtk.ListView.new(self.tree_selection, tree_factory)
         tree_view.add_css_class("archive-tree")
 
+        click_controller = Gtk.GestureClick()
+        click_controller.connect("pressed", self.on_tree_pressed)
+        tree_view.add_controller(click_controller)
+
         tree_scroll = Gtk.ScrolledWindow()
         tree_scroll.set_child(tree_view)
 
@@ -817,22 +821,52 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
     def on_right_selection_changed(self, _selection, _position, _n_items):
         self._update_extract_button()
 
+    def on_tree_pressed(self, _gesture, _n_press, _x, _y):
+        row = self.tree_selection.get_selected_item()
+        if row and row.get_item():
+            node = row.get_item()
+            if node.path == "":
+                self.right_selection.unselect_all()
+                self._update_extract_button()
+
     def _update_extract_button(self):
         if self.extracting or self.loading:
             self.extract_btn.set_sensitive(False)
             return
 
-        n = self.right_selection.get_selection().get_size()
+        if self.current_archive is None:
+            self.extract_btn.set_label("Auswahl extrahieren")
+            self.extract_btn.set_sensitive(False)
+            return
 
+        # 1. Rechte Seite (explizite Dateiauswahl) hat Vorrang
+        right_selection_count = 0
+        if hasattr(self, 'right_selection') and self.right_selection:
+            bitset = self.right_selection.get_selection()
+            if bitset:
+                right_selection_count = bitset.get_size()
+
+        if right_selection_count > 0:
+            self.extract_btn.set_label("Auswahl extrahieren")
+            self.extract_btn.set_sensitive(True)
+            return
+
+        # 2. Fallback auf linke Seitenleiste
         sidebar_model = self.tree_selection.get_model()
         sidebar_pos = self.tree_selection.get_selected()
+
+        is_root_selected = False
         if sidebar_pos != 0xffffffff and sidebar_model:
             row = sidebar_model.get_item(sidebar_pos)
             if row and row.get_item() and row.get_item().path == "":
-                self.extract_btn.set_sensitive(self.current_archive is not None)
-                return
+                is_root_selected = True
 
-        self.extract_btn.set_sensitive(n > 0 and self.current_archive is not None)
+        if is_root_selected:
+            self.extract_btn.set_label("Archiv extrahieren")
+            self.extract_btn.set_sensitive(True)
+        else:
+            self.extract_btn.set_label("Auswahl extrahieren")
+            self.extract_btn.set_sensitive(False)
 
     def on_search_changed(self, _entry):
         self._apply_search()
