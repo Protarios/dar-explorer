@@ -27,30 +27,60 @@ def normalize_archive_argument(path: str) -> str:
     m = re.match(r"^(.*)\.(\d+)\.dar$", path)
     return m.group(1) if m else path
 
-def format_size(size_bytes_str: str) -> str:
+def format_size(size_val: str | int) -> str:
     """
-    Konvertiert die Byte-Zahl aus dem XML in ein gut lesbares Format wie 'df -h'.
-    Schneidet störende Einheiten wie 'o' ab, um Abstürze zu verhindern.
+    Konvertiert Byte-Zahlen oder vorgefertigte Größen-Strings in kompaktes,
+    gut lesbares Format (z.B. '12 K', '13.5 G').
     """
-    try:
-        clean_str = re.sub(r"[ \toB]", "", size_bytes_str)
-        if not clean_str:
+    if not size_val or size_val == "—":
+        return "—"
+
+    # Falls der Wert als String vorliegt, bereinigen und versuchen als Zahl zu interpretieren
+    if isinstance(size_val, str):
+        raw = size_val.strip()
+        if not raw:
             return "0 B"
 
-        bytes_val = int(clean_str)
-        if bytes_val < 0:
-            return "0 B"
+        # Falls "Mio" oder "Milliard" aus lokalisierter dar-Ausgabe kommt
+        if "mio" in raw.lower():
+            raw = re.sub(r"[^\d,\.]", "", raw).replace(",", ".")
+            try:
+                bytes_num = float(raw) * 1_000_000
+            except ValueError:
+                return size_val
+        elif "mrd" in raw.lower() or "milliarde" in raw.lower():
+            raw = re.sub(r"[^\d,\.]", "", raw).replace(",", ".")
+            try:
+                bytes_num = float(raw) * 1_000_000_000
+            except ValueError:
+                return size_val
+        else:
+            # Versuche reine Ziffern zu extrahieren
+            clean_str = re.sub(r"[^\d]", "", raw)
+            if not clean_str:
+                return raw
+            bytes_num = int(clean_str)
+    else:
+        bytes_num = int(size_val)
 
-        for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
-            if bytes_val < 1000:
-                if unit == "B":
-                    return f"{bytes_val} B"
-                return f"{bytes_val:.1f} {unit}".replace(".", ",")
-            bytes_val /= 1000
+    if bytes_num <= 0:
+        return "0 B"
 
-        return f"{bytes_val:.1f} EB".replace(".", ",")
-    except (ValueError, TypeError):
-        return size_bytes_str
+    # Umrechnung in Einheiten B, K, M, G, T
+    units = ["B", "K", "M", "G", "T", "P"]
+    val = float(bytes_num)
+    unit_idx = 0
+
+    while val >= 1024.0 and unit_idx < len(units) - 1:
+        val /= 1024.0
+        unit_idx += 1
+
+    if unit_idx == 0:
+        return f"{int(val)} B"
+
+    # Eine Nachkommastelle bei Fließkommazahlen, z.B. 13.5 G
+    formatted = f"{val:.1f}".rstrip("0").rstrip(".")
+    return f"{formatted} {units[unit_idx]}"
 
 
 def format_date(timestamp_str: str) -> str:
