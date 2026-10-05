@@ -466,10 +466,10 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.progress.set_margin_end(10)
 
         # --- UNTERER BEREICH: Aufgeteilt in Terminal (Links 2/3) und DAR-Ausgabe (Rechts 1/3) ---
-        bottom_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        bottom_paned.set_position(900) # Initiale Trennposition (ca. 2/3 von 1450 Breite)
-        bottom_paned.set_vexpand(True)
-        bottom_paned.set_hexpand(True)
+        self.bottom_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self.bottom_paned.set_position(900) # Initiale Trennposition (ca. 2/3 von 1450 Breite)
+        self.bottom_paned.set_vexpand(True)
+        self.bottom_paned.set_hexpand(True)
 
         # 1. Linke Seite: Eingebettetes VTE-Terminal
         self.terminal_widget = EmbeddedTerminal()
@@ -477,7 +477,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         term_frame.set_child(self.terminal_widget)
         term_frame.set_vexpand(True)
         term_frame.set_hexpand(True)
-        bottom_paned.set_start_child(term_frame)
+        self.bottom_paned.set_start_child(term_frame)
 
         # 2. Rechte Seite: Bestehende DAR-Ausgabe (Log View)
         log_frame = Gtk.Frame(label="DAR-Ausgabe")
@@ -492,12 +492,12 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         log_scroll.set_child(self.log_view)
         log_frame.set_child(log_scroll)
         self.log_frame = log_frame
-        bottom_paned.set_end_child(log_frame)
+        self.bottom_paned.set_end_child(log_frame)
 
         bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         bottom.append(self.progress)
         bottom.append(self.status_label)
-        bottom.append(bottom_paned)
+        bottom.append(self.bottom_paned)
 
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         main.append(info)
@@ -1426,7 +1426,8 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.log_frame.set_visible(True)
 
     def on_show_log_toggled(self, button):
-        self.log_frame.set_visible(button.get_active())
+        if hasattr(self, 'bottom_paned'):
+            self.bottom_paned.set_visible(button.get_active())
 
     def _update_progress_ui(self, current: int, total: int):
         self.progress.set_visible(True)
