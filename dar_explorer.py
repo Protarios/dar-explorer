@@ -276,6 +276,149 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
         return False
 
+    def _prompt_user_choice_queue(self, message):
+        """Öffnet einen GTK4-Dialog mit Abbrechen und Weiter über das Response-Signal."""
+        result_queue = queue.Queue()
+
+        def run_dialog():
+            dialog = Gtk.MessageDialog(
+                transient_for=getattr(self, 'window', None),
+                modal=True,
+                message_type=Gtk.MessageType.WARNING,
+                text="Archiv-Hinweis / Fehlendes Slice",
+                secondary_text=message
+            )
+            dialog.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
+            dialog.add_button("Weiter", Gtk.ResponseType.OK)
+
+            def on_response(dlg, response_id):
+                if response_id == Gtk.ResponseType.OK:
+                    result_queue.put("weiter")
+                else:
+                    result_queue.put("abbrechen")
+                dlg.destroy()
+
+            dialog.connect("response", on_response)
+            dialog.present()
+
+        GLib.idle_add(run_dialog)
+        return result_queue.get()
+
+    def _prompt_user_info_queue(self, message):
+        """Öffnet einen einfachen GTK4-Fehlerdialog mit nur einem OK-Button."""
+        result_queue = queue.Queue()
+
+        def run_dialog():
+            dialog = Gtk.MessageDialog(
+                transient_for=getattr(self, 'window', None),
+                modal=True,
+                message_type=Gtk.MessageType.ERROR,
+                text="Archiv-Fehler",
+                secondary_text=message
+            )
+            dialog.add_button("OK", Gtk.ResponseType.OK)
+
+            def on_response(dlg, response_id):
+                result_queue.put(True)
+                dlg.destroy()
+
+            dialog.connect("response", on_response)
+            dialog.present()
+
+        GLib.idle_add(run_dialog)
+        result_queue.get()
+
+    def _ask_tape_mode(self, callback):
+        window = Gtk.Window(title="Archiv-Modus wählen", transient_for=self, modal=True)
+        window.set_default_size(450, -1)
+
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        main_box.set_margin_top(15)
+        main_box.set_margin_bottom(15)
+        main_box.set_margin_start(15)
+        main_box.set_margin_end(15)
+        window.set_child(main_box)
+
+        label = Gtk.Label()
+        label.set_markup(
+            "<b>Die Teilsicherungen (Slices) dieses Archivs sind unvollständig.</b>\n\n"
+            "Handelt es sich um ein <b>Bandlaufwerk (LTFS)</b>, bei dem die verbleibenden "
+            "Slices durch Bandwechsel nachgeladen werden müssen?\n\n"
+            "• <b>Ja (Tape-Modus):</b> Das Tool nutzt dar_manager, damit fehlende Slices "
+            "beim Entpacken interaktiv vom Band angefordert werden können.\n"
+            "• <b>Nein (Lokal):</b> Das Archiv wird direkt vor Ort geöffnet."
+        )
+        label.set_xalign(0)
+        label.set_wrap(True)
+        main_box.append(label)
+
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        button_box.set_halign(Gtk.Align.END)
+        main_box.append(button_box)
+
+        btn_no = Gtk.Button(label="Nein, lokal öffnen")
+        btn_yes = Gtk.Button(label="Ja, Tape-Modus aktivieren")
+        btn_yes.add_css_class("suggested-action")
+
+        button_box.append(btn_no)
+        button_box.append(btn_yes)
+
+        def on_choice(button, is_tape):
+            window.close()
+            callback(is_tape)
+
+        btn_no.connect("clicked", on_choice, False)
+        btn_yes.connect("clicked", on_choice, True)
+        window.present()
+
+    def _prompt_for_extraction_password_and_retry(self, real_archive_arg, catalog_path, dest_dir, paths_to_extract):
+        """Öffnet einen GTK-Dialog zur Passworteingabe und wiederholt die Extraktion."""
+        dialog = Gtk.Window(title="Passwort erforderlich", transient_for=self, modal=True)
+        dialog.set_default_size(400, -1)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(15)
+        box.set_margin_bottom(15)
+        box.set_margin_start(15)
+        box.set_margin_end(15)
+        dialog.set_child(box)
+
+        label = Gtk.Label(label="Das Archiv oder der Katalog ist verschlüsselt.\nBitte gib das Passwort ein:")
+        box.append(label)
+
+        entry = Gtk.Entry()
+        entry.set_visibility(False)
+        box.append(entry)
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        btn_box.set_halign(Gtk.Align.END)
+        box.append(btn_box)
+
+        btn_cancel = Gtk.Button(label="Abbrechen")
+        btn_ok = Gtk.Button(label="Extrahieren")
+        btn_ok.add_css_class("suggested-action")
+
+        btn_box.append(btn_cancel)
+        btn_box.append(btn_ok)
+
+        def on_ok(btn):
+            pwd = entry.get_text()
+            self.archive_password = pwd
+            dialog.destroy()
+            self._execute_extraction_with_catalog_reference(real_archive_arg, catalog_path, dest_dir, paths_to_extract, forced_password=pwd)
+
+        def on_cancel(btn):
+            dialog.destroy()
+            if hasattr(self, 'progress'):
+                self.progress.set_visible(False)
+            if hasattr(self, 'status_label'):
+                self.status_label.set_text("Extraktion abgebrochen.")
+
+        btn_ok.connect("clicked", on_ok)
+        btn_cancel.connect("clicked", on_cancel)
+        dialog.present()
+
+
     def update_archive_banner(self, is_catalog=False):
         if is_catalog:
             markup = "🔍 <b>Isolierter Katalog</b>"
@@ -662,6 +805,13 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                 cache_dir = Path("/tmp/dar-explorer/catalogs")
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 catalog_target = cache_dir / f"{Path(path).stem}.dar"
+
+                # Alten temporären Katalog vor Neuerstellung löschen
+                if catalog_target.exists():
+                    try:
+                        catalog_target.unlink()
+                    except OSError:
+                        pass
 
                 self._create_catalog_interactive(
                     path,
