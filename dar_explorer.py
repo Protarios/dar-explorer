@@ -838,6 +838,13 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 catalog_target_path = cache_dir / f"{clean_name}.dar"
 
+                # Alle alten Slices/Dateien dieses Katalogs im Cache restlos aufräumen
+                for old_file in cache_dir.glob(f"{clean_name}.dar*"):
+                    try:
+                        old_file.unlink()
+                    except OSError:
+                        pass
+
                 dar_bin = get_dar_executable()
 
                 cmd_args = [dar_bin, "-C", str(catalog_target_path), "-A", archive_arg, "-Q"]
@@ -858,11 +865,60 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                     env=env
                 )
 
+                full_output = ""
                 if process.stdout:
                     for line in process.stdout.splitlines():
                         cleaned = line.strip()
                         if cleaned:
                             self._append_log_threadsafe(f"[dar]: {cleaned}")
+                            full_output += cleaned + "\n"
+
+                # DIREKTE PRÜFUNG HIER: Ist das End-Slice/die letzte Datei nicht da?
+                if "The last file of the set is not present" in full_output:
+                    def show_missing_slice_dialog():
+                        self.loading = False
+                        if hasattr(self, 'progress') and self.progress:
+                            self.progress.set_visible(False)
+                        if hasattr(self, 'status_label') and self.status_label:
+                            self.status_label.set_text("Unvollständiges Archiv erkannt.")
+                        if hasattr(self, 'reload_btn') and self.reload_btn:
+                            self.reload_btn.set_sensitive(True)
+
+                        # GTK-Dialog für das fehlende End-Slice
+                        dialog_window = Gtk.Window(title="Unvollständiges Archiv", transient_for=self, modal=True)
+                        dialog_window.set_default_size(480, -1)
+
+                        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+                        box.set_margin_top(15)
+                        box.set_margin_bottom(15)
+                        box.set_margin_start(15)
+                        box.set_margin_end(15)
+                        dialog_window.set_child(box)
+
+                        lbl = Gtk.Label()
+                        lbl.set_markup(
+                            "<b>Das Archiv ist unvollständig (End-Slice fehlt).</b>\n\n"
+                            "Für die Erstellung eines isolierten Katalogs wird das letzte Slice/Band benötigt.\n"
+                            "Bitte lege das entsprechende Medium bereit."
+                        )
+                        lbl.set_wrap(True)
+                        lbl.set_xalign(0)
+                        box.append(lbl)
+
+                        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+                        btn_box.set_halign(Gtk.Align.END)
+                        box.append(btn_box)
+
+                        btn_ok = Gtk.Button(label="Verstanden / Abbrechen")
+                        btn_ok.add_css_class("suggested-action")
+                        btn_box.append(btn_ok)
+
+                        btn_ok.connect("clicked", lambda *_: (dialog_window.close(), setattr(self, 'loading', False)))
+                        dialog_window.present()
+
+                    GLib.idle_add(show_missing_slice_dialog)
+                    GLib.idle_add(lambda: callback(None))
+                    return
 
                 if process.returncode == 0:
                     self._append_log_threadsafe("[System]: Isolierter Katalog erfolgreich erstellt.")
