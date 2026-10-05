@@ -5,7 +5,7 @@ GTK4-GUI für DAR mit Mehrfachauswahl und Extraktion.
 ## Installation – CachyOS
 
 ```bash
-sudo pacman -S gtk4 python-gobject
+sudo pacman -S python-gobject gtk4 vte4
 ```
 
 DAR selbst muss bereits installiert sein:

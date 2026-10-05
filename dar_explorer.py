@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 DAR Explorer V2 - GTK4 Frontend für DAR & dar_manager.
-Vollständige Integration mit Unterstützung für lokale Slices und Tape-Modus (LTFS / Bandwechsel).
+Vollständige Integration mit Unterstützung für lokale Slices und Tape-Modus (LTFS / Bandwechsel)
+sowie integriertem VTE-Terminal im unteren Bereich.
 """
 
 from __future__ import annotations
@@ -14,12 +15,12 @@ import sys
 import threading
 import queue
 from pathlib import Path
-from tkinter import messagebox, simpledialog
 
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango
+gi.require_version("Vte", "3.91")
+from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango, Vte
 
 from dar_parser import ParsedEntry, normalize_archive_argument, run_dar_listing
 
@@ -42,6 +43,54 @@ def get_dar_executable() -> str:
         if os.path.exists(path) and os.access(path, os.X_OK):
             return path
     return "dar"
+
+class EmbeddedTerminal(Gtk.Box):
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        # VTE Terminal Widget erstellen
+        self.terminal = Vte.Terminal()
+
+        # Scrollbars hinzufügen, damit man im Terminal scrollen kann (GTK4 konform)
+        self.scrolled_window = Gtk.ScrolledWindow()
+        self.scrolled_window.set_policy(
+            Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC
+        )
+        self.scrolled_window.set_child(self.terminal)
+        self.scrolled_window.set_vexpand(True)
+        self.scrolled_window.set_hexpand(True)
+
+        # ScrolledWindow in unsere Box packen (GTK4: append statt pack_start)
+        self.append(self.scrolled_window)
+
+        # Standard-Shell starten (z.B. Bash oder Zsh)
+        self.start_shell()
+
+    def start_shell(self):
+        shell = os.environ.get('SHELL', '/bin/bash')
+        cwd = os.environ.get('HOME', '/')
+
+        try:
+            self.terminal.spawn_async(
+                Vte.PtyFlags.DEFAULT,
+                cwd,
+                [shell],
+                [],
+                GLib.SpawnFlags.DEFAULT,
+                None,
+                None,
+                -1,  # Timeout (-1 = kein Timeout)
+                None,
+                self.on_spawn_complete,
+            )
+        except Exception as e:
+            print(f'Fehler beim Starten der Shell: {e}')
+
+    def on_spawn_complete(self, terminal, pid, error):
+        if error:
+            print(f'Terminal-Spawn fehlgeschlagen: {error}')
+        else:
+            print(f'Terminal erfolgreich gestartet mit PID: {pid}')
 
 
 class DarNode(GObject.Object):
@@ -187,7 +236,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
         self.current_archive = None
         self.archive_password = None
-        self.is_current_catalog = False  # <--- NEU: Zentraler Zustand
+        self.is_current_catalog = False
         self.all_nodes = []
         self.root_store = None
         self.loading = False
@@ -204,15 +253,13 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         if not file_path.exists():
             return False
 
-        # 1. Größen-Heuristik: Ein reiner Katalog ist fast nie größer als 1 GB
         try:
             file_size_gb = file_path.stat().st_size / (1024 * 1024 * 1024)
             if file_size_gb > 1.0:
-                return False  # Größer als 1 GB -> Definitiv kein reiner Katalog
+                return False
         except Exception:
             pass
 
-        # 2. Testlauf mit dar -t für Dateien unter 1 GB
         try:
             dar_bin = get_dar_executable()
             result = subprocess.run(
@@ -229,51 +276,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
         return False
 
-    def _ask_tape_mode(self, callback):
-        window = Gtk.Window(title="Archiv-Modus wählen", transient_for=self, modal=True)
-        window.set_default_size(450, -1)
-
-        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
-        main_box.set_margin_top(15)
-        main_box.set_margin_bottom(15)
-        main_box.set_margin_start(15)
-        main_box.set_margin_end(15)
-        window.set_child(main_box)
-
-        label = Gtk.Label()
-        label.set_markup(
-            "<b>Die Teilsicherungen (Slices) dieses Archivs sind unvollständig.</b>\n\n"
-            "Handelt es sich um ein <b>Bandlaufwerk (LTFS)</b>, bei dem die verbleibenden "
-            "Slices durch Bandwechsel nachgeladen werden müssen?\n\n"
-            "• <b>Ja (Tape-Modus):</b> Das Tool nutzt dar_manager, damit fehlende Slices "
-            "beim Entpacken interaktiv vom Band angefordert werden können.\n"
-            "• <b>Nein (Lokal):</b> Das Archiv wird direkt vor Ort geöffnet."
-        )
-        label.set_xalign(0)
-        label.set_wrap(True)
-        main_box.append(label)
-
-        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        button_box.set_halign(Gtk.Align.END)
-        main_box.append(button_box)
-
-        btn_no = Gtk.Button(label="Nein, lokal öffnen")
-        btn_yes = Gtk.Button(label="Ja, Tape-Modus aktivieren")
-        btn_yes.add_css_class("suggested-action")
-
-        button_box.append(btn_no)
-        button_box.append(btn_yes)
-
-        def on_choice(button, is_tape):
-            window.close()
-            callback(is_tape)
-
-        btn_no.connect("clicked", on_choice, False)
-        btn_yes.connect("clicked", on_choice, True)
-        window.present()
-
     def update_archive_banner(self, is_catalog=False):
-        """Aktualisiert die obere rechte Zeile (Typ-Anzeige)."""
         if is_catalog:
             markup = "🔍 <b>Isolierter Katalog</b>"
         else:
@@ -282,7 +285,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         GLib.idle_add(self.archive_status_right_label.set_markup, markup)
 
     def reset_archive_banner(self):
-        """Setzt die Anzeige zurück, wenn kein Archiv geladen ist."""
         GLib.idle_add(self.archive_status_right_label.set_markup, "<span color='gray'>Kein Archiv/Katalog geladen</span>")
 
     def _build_config_popover(self, menu_button):
@@ -370,7 +372,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self._build_config_popover(config_btn)
         header.pack_end(config_btn)
 
-        # Linke Seite (zweizeilig: Archiv-Pfad / aktueller Unterpfad)
         self.archive_label = Gtk.Label(label="Kein Archiv geöffnet")
         self.archive_label.set_xalign(0)
         self.archive_label.add_css_class("dim-label")
@@ -385,7 +386,11 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         left_info.append(self.archive_label)
         left_info.append(self.path_label)
 
-        # Rechte Seite (zweizeilig: Oben Typ, Unten Statistiken)
+        self.show_log_btn = Gtk.ToggleButton(label="Terminal & Log")
+        self.show_log_btn.set_active(True)
+        self.show_log_btn.connect("toggled", self.on_show_log_toggled)
+        header.pack_end(self.show_log_btn)
+
         self.archive_status_right_label = Gtk.Label(label="Kein Archiv/Katalog geladen")
         self.archive_status_right_label.set_xalign(1)
         self.archive_status_right_label.add_css_class("dim-label")
@@ -395,8 +400,8 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.total_stats_label.add_css_class("dim-label")
 
         right_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        right_info.append(self.archive_status_right_label) # Oben: Typ
-        right_info.append(self.total_stats_label)          # Unten: Statistiken
+        right_info.append(self.archive_status_right_label)
+        right_info.append(self.total_stats_label)
 
         info = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         info.set_margin_top(8)
@@ -460,6 +465,21 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.progress.set_margin_start(10)
         self.progress.set_margin_end(10)
 
+        # --- UNTERER BEREICH: Aufgeteilt in Terminal (Links 2/3) und DAR-Ausgabe (Rechts 1/3) ---
+        bottom_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        bottom_paned.set_position(900) # Initiale Trennposition (ca. 2/3 von 1450 Breite)
+        bottom_paned.set_vexpand(True)
+        bottom_paned.set_hexpand(True)
+
+        # 1. Linke Seite: Eingebettetes VTE-Terminal
+        self.terminal_widget = EmbeddedTerminal()
+        term_frame = Gtk.Frame(label="Echtes Terminal")
+        term_frame.set_child(self.terminal_widget)
+        term_frame.set_vexpand(True)
+        term_frame.set_hexpand(True)
+        bottom_paned.set_start_child(term_frame)
+
+        # 2. Rechte Seite: Bestehende DAR-Ausgabe (Log View)
         log_frame = Gtk.Frame(label="DAR-Ausgabe")
         self.log_view = Gtk.TextView()
         self.log_view.set_editable(False)
@@ -471,22 +491,13 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         log_scroll.set_min_content_height(130)
         log_scroll.set_child(self.log_view)
         log_frame.set_child(log_scroll)
-        log_frame.set_visible(False)
         self.log_frame = log_frame
-
-        self.show_log_btn = Gtk.ToggleButton(label="DAR-Ausgabe anzeigen")
-        self.show_log_btn.set_margin_start(10)
-        self.show_log_btn.set_margin_end(10)
-        self.show_log_btn.connect("toggled", self.on_show_log_toggled)
+        bottom_paned.set_end_child(log_frame)
 
         bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         bottom.append(self.progress)
         bottom.append(self.status_label)
-
-        log_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        log_controls.append(self.show_log_btn)
-        bottom.append(log_controls)
-        bottom.append(log_frame)
+        bottom.append(bottom_paned)
 
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         main.append(info)
@@ -582,12 +593,10 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
         path = str(Path(path).expanduser())
 
-        # --- HIER WIRD DIE KONTROLLE INTEGRIERT ---
         is_catalog = self.check_if_catalog(path)
         self.is_current_catalog = is_catalog
 
         all_present = True if is_catalog else check_all_slices_present(path)
-        # ------------------------------------------
 
         def execute_load(target_path, is_cat):
             self.current_archive = target_path
@@ -597,8 +606,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             self._gui_file_count = 0
 
             self.update_archive_banner(is_catalog=is_cat)
-
-            # (Der Rest der Methode bleibt unverändert...)
 
             self.reload_btn.set_sensitive(False)
             self.extract_btn.set_sensitive(False)
@@ -617,7 +624,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         if is_catalog or all_present:
             execute_load(path, is_cat=is_catalog)
         else:
-            # Slices fehlen -> Dialog anzeigen
             dialog_window = Gtk.Window(title="Isolierten Katalog anlegen?", transient_for=self, modal=True)
             dialog_window.set_default_size(480, -1)
 
@@ -667,62 +673,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             btn_create.connect("clicked", on_action, True)
             dialog_window.present()
 
-    def _prompt_user_choice_queue(self, message):
-        """Öffnet einen GTK4-Dialog mit Abbrechen und Weiter über das Response-Signal."""
-        result_queue = queue.Queue()
-
-        def run_dialog():
-            dialog = Gtk.MessageDialog(
-                transient_for=getattr(self, 'window', None),
-                message_type=Gtk.MessageType.WARNING,
-                buttons=Gtk.ButtonsType.NONE,
-                text="Archiv-Hinweis / Fehlendes Slice",
-                secondary_text=message
-            )
-            dialog.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
-            dialog.add_button("Weiter", Gtk.ResponseType.OK)
-
-            # GTK4 konformes Signal-Handling statt .run()
-            def on_response(dlg, response_id):
-                if response_id == Gtk.ResponseType.OK:
-                    result_queue.put("weiter")
-                else:
-                    result_queue.put("abbrechen")
-                dlg.destroy()
-
-            dialog.connect("response", on_response)
-            dialog.set_modal(True)
-            dialog.present()
-
-        GLib.idle_add(run_dialog)
-        return result_queue.get()
-
-    def _prompt_user_info_queue(self, message):
-        """Öffnet einen einfachen GTK4-Fehlerdialog mit nur einem OK-Button."""
-        result_queue = queue.Queue()
-
-        def run_dialog():
-            dialog = Gtk.MessageDialog(
-                transient_for=getattr(self, 'window', None),
-                message_type=Gtk.MessageType.ERROR,
-                buttons=Gtk.ButtonsType.OK,
-                text="Archiv-Fehler",
-                secondary_text=message
-            )
-
-            def on_response(dlg, response_id):
-                result_queue.put(True)
-                dlg.destroy()
-
-            dialog.connect("response", on_response)
-            dialog.set_modal(True)
-            dialog.present()
-
-        GLib.idle_add(run_dialog)
-        result_queue.get()
-
     def _create_catalog_interactive(self, archive_path, catalog_target, callback):
-        """Erzeugt einen isolierten Katalog via subprocess, da -J das Passwort direkt frisst."""
         self.status_label.set_text("Erstelle isolierten Katalog...")
         self.progress.set_visible(True)
         self.progress.pulse()
@@ -739,7 +690,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
                 dar_bin = get_dar_executable()
 
-                # Exakt die Syntax, die im Terminal funktioniert:
                 cmd_args = [dar_bin, "-C", str(catalog_target_path), "-A", archive_arg, "-Q"]
                 if self.archive_password:
                     cmd_args.extend(["-J", self.archive_password])
@@ -768,13 +718,11 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                     self._append_log_threadsafe("[System]: Isolierter Katalog erfolgreich erstellt.")
                     GLib.idle_add(lambda: callback(str(catalog_target_path)))
                 else:
-                    # Falls es fehlschlägt (z.B. falsches Passwort), versuchen wir es über die GUI zu erfragen
                     error_output = process.stdout.lower() if process.stdout else ""
                     if any(kw in error_output for kw in ["password", "secu_string", "krypt", "auth", "encryption"]):
                         pwd = self._prompt_user_interactive_queue("Das Passwort ist falsch oder erforderlich:")
                         if pwd is not None:
                             self.archive_password = pwd
-                            # Rekursiver Aufruf mit neuem Passwort
                             GLib.idle_add(lambda: self._create_catalog_interactive(archive_path, catalog_target, callback))
                             return
 
@@ -785,23 +733,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                 GLib.idle_add(lambda: callback(None))
 
         threading.Thread(target=worker, daemon=True).start()
-
-    def _show_fatal_slice_error(self, message, callback):
-        """Zeigt das Info-Pop-up im Hauptthread und führt danach den sauberen Abbruch aus."""
-        dialog = Gtk.MessageDialog(
-            transient_for=getattr(self, 'window', None),
-            message_type=Gtk.MessageType.ERROR,
-            buttons=Gtk.ButtonsType.OK,
-            text="Archiv-Fehler: Fehlendes Slice",
-            secondary_text=f"Das Archiv ist unvollständig:\n\n{message}"
-        )
-        def on_response(dlg, response_id):
-            dlg.destroy()
-            callback(True, "FATAL_SLICE_MISSING")
-
-        dialog.connect("response", on_response)
-        dialog.set_modal(True)
-        dialog.present()
 
     def _pulse_progress(self, count=None):
         if not self.loading:
@@ -830,7 +761,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             dar_bin = get_dar_executable()
             check_cmd = [dar_bin, "-n", "-l", archive_arg, "-Q", "-N"]
 
-            # Passwort direkt beim Vorab-Check mitgeben, falls schon vorhanden
             if self.archive_password:
                 check_cmd.extend(["-K", self.archive_password])
 
@@ -857,8 +787,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             returncode = check_process.returncode
 
             if returncode != 0:
-                # Nur im Fehlerfall (z. B. Passwort fehlt) öffnen wir das Log
-                GLib.idle_add(self._force_show_log)
                 self._append_log_threadsafe("[System]: Archiv geschützt oder erfordert Passwort / Fehler aufgetreten:")
                 for line in check_output_lines:
                     self._append_log_threadsafe(f"[dar]: {line}")
@@ -869,7 +797,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                 else:
                     raise RuntimeError("Archiv-Einlesen vom Benutzer abgebrochen.")
 
-            # Lokales Einlesen über den Standard-Parser (mit übergebenem Passwort)
             entries, warning = run_dar_listing(
                 path,
                 password_callback=password_callback,
@@ -881,7 +808,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         except Exception as exc:
             GLib.idle_add(self._load_finished, path, None, "", str(exc))
 
-
     def _load_finished(self, path, entries, warning, error):
         self.loading = False
         self.reload_btn.set_sensitive(True)
@@ -891,7 +817,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.progress.set_text("")
 
         if error:
-            self.status_label.set_text
             self.reset_archive_banner()
             self._show_error("DAR Explorer", error)
             return False
@@ -996,17 +921,15 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             self.extract_btn.set_sensitive(False)
             return
 
-        # Für isolierte Kataloge erlauben wir die Extraktion nun über das echte Archiv!
         if getattr(self, 'is_current_catalog', False):
             self.extract_btn.set_label("Aus Katalog extrahieren...")
             self.extract_btn.set_sensitive(True)
             self.extract_btn.set_tooltip_text("Extrahiert Dateien mithilfe des echten Archivs und dieses Katalogs.")
         else:
-            self.extract_btn.set_label("Extrahieren") # Oder deinen Standard-Button-Text
+            self.extract_btn.set_label("Extrahieren")
             self.extract_btn.set_sensitive(True)
             self.extract_btn.set_tooltip_text(None)
 
-        # 1. Rechte Seite (explizite Dateiauswahl) hat Vorrang
         right_selection_count = 0
         if hasattr(self, 'right_selection') and self.right_selection:
             bitset = self.right_selection.get_selection()
@@ -1018,7 +941,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             self.extract_btn.set_sensitive(True)
             return
 
-        # 2. Fallback auf linke Seitenleiste
         sidebar_model = self.tree_selection.get_model()
         sidebar_pos = self.tree_selection.get_selected()
 
@@ -1082,7 +1004,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             self.load_archive(self.current_archive)
 
     def _execute_extraction_with_catalog_reference(self, real_archive_arg, catalog_path, dest_dir, paths_to_extract, archive_password=None, restore_ownership=False):
-        """Führt die Extraktion aus und berücksichtigt -O (Rechte ignorieren) wenn gewünscht."""
         self.status_label.set_text("Extrahiere Daten mit Katalog-Referenz...")
         self.progress.set_visible(True)
         self.progress.pulse()
@@ -1116,7 +1037,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                         "-Q"
                     ])
 
-                    # WICHTIG: Wenn KEINE Originalrechte erzwungen werden, -O (ignore ownership) übergeben
                     if not restore_ownership:
                         cmd_args.append("-O")
 
@@ -1144,7 +1064,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                             if cleaned:
                                 self._append_log_threadsafe(f"[dar extract]: {cleaned}")
 
-                    # --- ENCRYPTION DETECTOR & RETRY FÜR DAS ARCHIV (-K) ---
                     if "secu_string" in output_text or process.returncode != 0:
                         if not current_archive_pwd:
                             self._append_log_threadsafe("[System]: Das echte Archiv benötigt ein Passwort. Öffne Passworteingabe...")
@@ -1187,57 +1106,20 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                             GLib.idle_add(prompt_in_main_thread)
                             return
                         else:
-                            GLib.idle_add(lambda: self.show_error_dialog("Fehler bei der Extraktion (Falsches Archiv-Passwort?). Siehe Log."))
+                            GLib.idle_add(lambda: self._show_error("Fehler", "Fehler bei der Extraktion (Falsches Archiv-Passwort?). Siehe Log."))
                             return
 
                 self._append_log_threadsafe("[System]: Extraktion mit Katalog-Referenz erfolgreich abgeschlossen.")
-                GLib.idle_add(lambda: self.show_info_dialog("Extraktion erfolgreich beendet!"))
+                GLib.idle_add(lambda: self._show_error("Erfolg", "Extraktion erfolgreich beendet!"))
 
             except Exception as e:
                 self._append_log_threadsafe(f"[Fehler Extraktion]: {e}")
-                GLib.idle_add(lambda: self.show_error_dialog(f"Ausnahmefehler: {e}"))
+                GLib.idle_add(lambda: self._show_error("Fehler", f"Ausnahmefehler: {e}"))
             finally:
                 if not archive_password:
                     GLib.idle_add(lambda: self.progress.set_visible(False))
 
         threading.Thread(target=worker, daemon=True).start()
-
-
-    def _prompt_for_extraction_password_and_retry(self, real_archive_arg, catalog_path, dest_dir, paths_to_extract):
-        """Öffnet einen GTK-Dialog zur Passworteingabe und wiederholt die Extraktion."""
-        dialog = Gtk.Dialog(title="Passwort erforderlich", transient_for=self, modal=True)
-        dialog.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
-        dialog.add_button("Extrahieren", Gtk.ResponseType.OK)
-
-        content_area = dialog.get_content_area()
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        box.set_margin_top(15)
-        box.set_margin_bottom(15)
-        box.set_margin_start(15)
-        box.set_margin_end(15)
-
-        label = Gtk.Label(label="Das Archiv oder der Katalog ist verschlüsselt.\nBitte gib das Passwort ein:")
-        box.append(label)
-
-        entry = Gtk.Entry()
-        entry.set_visibility(False)  # Passwort-Maskierung (Sternchen)
-        box.append(entry)
-        content_area.append(box)
-
-        def on_response(dlg, response_id):
-            if response_id == Gtk.ResponseType.OK:
-                pwd = entry.get_text()
-                self.archive_password = pwd  # Fürs nächste Mal speichern
-                dlg.destroy()
-                # Extraktion mit dem eingegebenen Passwort neu starten
-                self._execute_extraction_with_catalog_reference(real_archive_arg, catalog_path, dest_dir, paths_to_extract, forced_password=pwd)
-            else:
-                dlg.destroy()
-                self.progress.set_visible(False)
-                self.status_label.set_text("Extraktion abgebrochen.")
-
-        dialog.connect("response", on_response)
-        dialog.present()
 
     def on_extract_clicked(self, _button):
         paths_to_extract = []
@@ -1300,8 +1182,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                                         catalog_path = getattr(self, 'current_file', None) or getattr(self, 'current_archive_path', None) or "/tmp/dar-explorer/catalogs/"
 
                                     self._append_log_threadsafe(f"[Debug]: Nutze Katalog-Referenz: {catalog_path}")
-
-                                    # WICHTIG: Auch beim Katalog-Weg fragen wir jetzt nach den Berechtigungen!
                                     self._ask_for_permissions_mode(destination, paths_to_extract, real_archive_arg, catalog_path)
 
                             except Exception as e:
@@ -1309,7 +1189,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
                         file_dialog.open(self, None, on_file_picked)
                     else:
-                        # Normaler Weg
                         self._ask_for_permissions_mode(destination, paths_to_extract)
 
             except Exception as e:
@@ -1357,7 +1236,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
             restore_ownership = (action_type == "keep")
 
-            # Unterscheiden, ob Katalog-Modus oder normaler Modus
             if real_archive_arg and catalog_path:
                 self._execute_extraction_with_catalog_reference(
                     real_archive_arg, catalog_path, destination, paths_to_extract, restore_ownership=restore_ownership
@@ -1396,7 +1274,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             dar_bin = get_dar_executable()
             clean_archive = normalize_archive_argument(self.current_archive)
 
-            # Direkter dar -x Aufruf (funktioniert mit Archiven, Slices und Katalogen)
             cmd = [dar_bin, "-x", clean_archive, "-R", destination, "-w"]
 
             if not restore_ownership:
@@ -1410,7 +1287,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                     if p:
                         cmd.extend(["-g", p])
 
-            # Rechte-Wiederherstellung mit sudo
             sudo_pwd = None
             if restore_ownership:
                 sudo_pwd = self._prompt_user_interactive_queue(
@@ -1448,10 +1324,8 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
                 if line:
                     line_str = line.strip()
-                    print(f"[DAR OUT]: {line_str}", flush=True)
                     self._append_log_threadsafe(line_str)
 
-                    # Interaktive Prompts (Passwort, Slice-Wechsel, Bandwechsel etc.) abfangen
                     if any(prompt in line_str for prompt in [
                         "Passphrase", "Password", "Enter key", "stelle die Slice", "Please enter slice",
                         "Continue?", "overwrite", "Press enter", "Entscheidung:"
@@ -1469,23 +1343,19 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             if returncode == 0:
                 GLib.idle_add(self._extract_finished, "Extraktion erfolgreich abgeschlossen.")
             else:
-                GLib.idle_add(self._force_show_log)
                 GLib.idle_add(self._extract_finished, f"Extraktion fehlgeschlagen (Exit-Code {returncode}).")
 
         except Exception as e:
-            GLib.idle_add(self._force_show_log)
             self._append_log_threadsafe(f"[Fehler bei Extraktion]: {e}")
             GLib.idle_add(self._extract_finished, f"Fehler: {e}")
 
     def _prompt_user_interactive_queue(self, prompt_text: str) -> str | None:
         res_queue = queue.Queue()
-        print(f"[DEBUG] Warten auf Benutzereingabe: {prompt_text!r}", flush=True)
         GLib.idle_add(self._show_prompt_dialog, prompt_text, res_queue)
 
         while True:
             try:
                 val = res_queue.get(timeout=0.2)
-                print(f"[DEBUG] Eingabe erhalten: {val!r}", flush=True)
                 return val
             except queue.Empty:
                 pass
