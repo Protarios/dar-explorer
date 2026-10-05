@@ -48,10 +48,8 @@ class EmbeddedTerminal(Gtk.Box):
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
 
-        # VTE Terminal Widget erstellen
         self.terminal = Vte.Terminal()
 
-        # Scrollbars hinzufügen, damit man im Terminal scrollen kann (GTK4 konform)
         self.scrolled_window = Gtk.ScrolledWindow()
         self.scrolled_window.set_policy(
             Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC
@@ -60,10 +58,9 @@ class EmbeddedTerminal(Gtk.Box):
         self.scrolled_window.set_vexpand(True)
         self.scrolled_window.set_hexpand(True)
 
-        # ScrolledWindow in unsere Box packen (GTK4: append statt pack_start)
         self.append(self.scrolled_window)
 
-        # Standard-Shell starten (z.B. Bash oder Zsh)
+        # Standard-Shell starten (das lief vorhin fehlerfrei)
         self.start_shell()
 
     def start_shell(self):
@@ -79,7 +76,7 @@ class EmbeddedTerminal(Gtk.Box):
                 GLib.SpawnFlags.DEFAULT,
                 None,
                 None,
-                -1,  # Timeout (-1 = kein Timeout)
+                -1,
                 None,
                 self.on_spawn_complete,
             )
@@ -1210,122 +1207,91 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             self.load_archive(self.current_archive)
 
     def _execute_extraction_with_catalog_reference(self, real_archive_arg, catalog_path, dest_dir, paths_to_extract, archive_password=None, restore_ownership=False):
-        self.status_label.set_text("Extrahiere Daten mit Katalog-Referenz...")
-        self.progress.set_visible(True)
-        self.progress.pulse()
+        self.status_label.set_text("Starte Extraktion direkt im Terminal...")
+        self.progress.set_visible(False)
 
-        def worker():
-            try:
-                dar_bin = get_dar_executable()
+        # 0. Falls real_archive_arg eine file://-URI ist, in einen echten Pfad umwandeln!
+        if real_archive_arg.startswith("file://"):
+            from urllib.parse import urlparse
+            from urllib.request import url2pathname
+            parsed_url = urlparse(real_archive_arg)
+            real_archive_arg = url2pathname(parsed_url.path)
 
+        # 1. Sicherstellen, dass das Terminal-Frame in der UI sichtbar ist
+        if hasattr(self, 'term_frame') and self.term_frame:
+            self.term_frame.set_visible(True)
+
+        try:
+            dar_bin = get_dar_executable()
+
+            catalog_pwd = getattr(self, 'archive_password', None)
+            current_archive_pwd = archive_password if 'archive_password' in locals() else None
+
+            # 1. Sicherstellen, dass catalog_path absolut sauber ist (kein file://, kein /temp/)
+            if catalog_path and catalog_path.startswith("file://"):
+                from urllib.parse import urlparse
+                from urllib.request import url2pathname
+                catalog_path = url2pathname(urlparse(catalog_path).path)
+
+            if catalog_path and catalog_path.startswith("/temp/"):
+                catalog_path = catalog_path.replace("/temp/", "/tmp/", 1)
+
+            p_cat = Path(catalog_path)
+
+            if p_cat.is_dir():
+                archive_name = Path(real_archive_arg).name
+                base_name = re.sub(r'\.dar$', '', archive_name)
+                catalog_arg = str(p_cat / base_name)
+            else:
+                cat_str = str(p_cat)
+                catalog_arg = re.sub(r'\.\d+\.dar$', '', cat_str)
+                catalog_arg = re.sub(r'\.dar$', '', catalog_arg)
+
+            # 2. Doppelte Absicherung: Falls irgendwo ein file:// reingerutscht ist, radikal wegschneiden
+            if catalog_arg.startswith("file://"):
+                catalog_path = url2pathname(urlparse(catalog_arg).path)
                 p_cat = Path(catalog_path)
-                cat_filename = p_cat.name
-                cat_clean_name = re.sub(r'\.\d+\.dar$', '', cat_filename)
-                cat_clean_name = re.sub(r'\.dar$', '', cat_clean_name)
-                catalog_arg = str(p_cat.parent / cat_clean_name)
+                catalog_arg = str(p_cat.parent / re.sub(r'\.dar$', '', p_cat.name))
+                catalog_arg = re.sub(r'\.\d+$', '', catalog_arg)
 
-                catalog_pwd = getattr(self, 'archive_password', None)
-                current_archive_pwd = archive_password
+            # Prüfen, ob das Terminal-Widget bereit ist
+            if not hasattr(self, 'terminal_widget') or not self.terminal_widget:
+                self._show_error("Fehler", "Terminal-Widget ist in der UI nicht verfügbar.")
+                return
 
-                for path in paths_to_extract:
-                    cmd_args = [dar_bin]
+            for path in paths_to_extract:
+                cmd_args = [dar_bin]
 
-                    if catalog_pwd:
-                        cmd_args.extend(["-J", catalog_pwd])
+                if catalog_pwd:
+                    cmd_args.extend(["-J", catalog_pwd])
 
-                    if current_archive_pwd:
-                        cmd_args.extend(["-K", current_archive_pwd])
+                if current_archive_pwd:
+                    cmd_args.extend(["-K", current_archive_pwd])
 
-                    cmd_args.extend([
-                        "-x", real_archive_arg,
-                        "-A", catalog_arg,
-                        "-R", str(dest_dir),
-                        "-Q"
-                    ])
+                cmd_args.extend([
+                    "-x", real_archive_arg,  # Jetzt garantiert ein echter lokaler Pfad!
+                    "-A", catalog_arg,
+                    "-R", str(dest_dir)
+                ])
 
-                    if not restore_ownership:
-                        cmd_args.append("-O")
+                if not restore_ownership:
+                    cmd_args.append("-O")
 
-                    if path:
-                        cmd_args.extend(["-g", path])
+                if path:
+                    cmd_args.extend(["-g", path])
 
-                    self._append_log_threadsafe(f"[EXEC Extraktion]: {' '.join(cmd_args)}")
+                full_command_str = " ".join(cmd_args)
+                self._append_log_threadsafe(f"[EXEC Extraktion direkt im Terminal]: {full_command_str}")
 
-                    env = os.environ.copy()
-                    env["LC_ALL"] = "C"
-                    env["LANG"] = "C"
+                # Befehl in die laufende Bash-Shell des Terminals füttern
+                terminal_cmd = full_command_str + "\n"
+                self.terminal_widget.terminal.feed_child_binary(terminal_cmd.encode('utf-8'))
 
-                    process = subprocess.run(
-                        cmd_args,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        env=env
-                    )
+            self._append_log_threadsafe("[System]: Extraktionsbefehl(e) an das Terminal übergeben.")
 
-                    output_text = process.stdout or ""
-                    if output_text:
-                        for line in output_text.splitlines():
-                            cleaned = line.strip()
-                            if cleaned:
-                                self._append_log_threadsafe(f"[dar extract]: {cleaned}")
-
-                    if "secu_string" in output_text or process.returncode != 0:
-                        if not current_archive_pwd:
-                            self._append_log_threadsafe("[System]: Das echte Archiv benötigt ein Passwort. Öffne Passworteingabe...")
-
-                            def prompt_in_main_thread():
-                                dialog = Gtk.Dialog(title="Passwort für das Datenarchiv erforderlich", transient_for=self, modal=True)
-                                dialog.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
-                                dialog.add_button("Extrahieren", Gtk.ResponseType.OK)
-
-                                content_area = dialog.get_content_area()
-                                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-                                box.set_margin_top(15)
-                                box.set_margin_bottom(15)
-                                box.set_margin_start(15)
-                                box.set_margin_end(15)
-
-                                label = Gtk.Label(label="Das echte Datenarchiv (Ziel) ist verschlüsselt.\nBitte gib das Passwort ein:")
-                                box.append(label)
-
-                                entry = Gtk.Entry()
-                                entry.set_visibility(False)
-                                box.append(entry)
-                                content_area.append(box)
-
-                                def on_response(dlg, response_id):
-                                    if response_id == Gtk.ResponseType.OK:
-                                        entered_pwd = entry.get_text()
-                                        dlg.destroy()
-                                        self._execute_extraction_with_catalog_reference(
-                                            real_archive_arg, catalog_path, dest_dir, paths_to_extract, archive_password=entered_pwd, restore_ownership=restore_ownership
-                                        )
-                                    else:
-                                        dlg.destroy()
-                                        self.progress.set_visible(False)
-                                        self.status_label.set_text("Extraktion abgebrochen.")
-
-                                dialog.connect("response", on_response)
-                                dialog.present()
-
-                            GLib.idle_add(prompt_in_main_thread)
-                            return
-                        else:
-                            GLib.idle_add(lambda: self._show_error("Fehler", "Fehler bei der Extraktion (Falsches Archiv-Passwort?). Siehe Log."))
-                            return
-
-                self._append_log_threadsafe("[System]: Extraktion mit Katalog-Referenz erfolgreich abgeschlossen.")
-                GLib.idle_add(lambda: self._show_error("Erfolg", "Extraktion erfolgreich beendet!"))
-
-            except Exception as e:
-                self._append_log_threadsafe(f"[Fehler Extraktion]: {e}")
-                GLib.idle_add(lambda: self._show_error("Fehler", f"Ausnahmefehler: {e}"))
-            finally:
-                if not archive_password:
-                    GLib.idle_add(lambda: self.progress.set_visible(False))
-
-        threading.Thread(target=worker, daemon=True).start()
+        except Exception as e:
+            self._append_log_threadsafe(f"[Fehler Extraktion]: {e}")
+            self._show_error("Fehler", f"Ausnahmefehler: {e}")
 
     def on_extract_clicked(self, _button):
         paths_to_extract = []
