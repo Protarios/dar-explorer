@@ -23,6 +23,8 @@ gi.require_version("Vte", "3.91")
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango, Vte
 
 from dar_parser import ParsedEntry, normalize_archive_argument, run_dar_listing
+from dar_backend.archive import ArchiveCreateOptions
+from dialogs.archive_create import ArchiveCreateDialog
 
 
 def get_dar_manager_executable() -> str | None:
@@ -494,6 +496,12 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         open_btn = Gtk.Button(label="Archiv öffnen")
         open_btn.connect("clicked", self.on_open_clicked)
         header.pack_start(open_btn)
+
+        create_btn = Gtk.Button(label="Archiv erstellen")
+        create_btn.add_css_class("suggested-action")
+        create_btn.set_tooltip_text("Neues DAR-Archiv bzw. Differentialbackup erstellen")
+        create_btn.connect("clicked", self.on_create_archive_clicked)
+        header.pack_start(create_btn)
 
         self.reload_btn = Gtk.Button(label="Neu laden")
         self.reload_btn.connect("clicked", self.on_reload_clicked)
@@ -1242,6 +1250,37 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         dialog.set_title("DAR-Archiv auswählen")
         dialog.open(self, None, self._open_done)
 
+    def on_create_archive_clicked(self, _button):
+        """Öffnet den modularen DAR-Archiv-Erstellungsdialog."""
+        dialog = ArchiveCreateDialog(self, self._create_archive_in_terminal)
+        dialog.present()
+
+    def _create_archive_in_terminal(self, options: ArchiveCreateOptions, argv: list[str], command: str):
+        """Startet DAR ausschließlich in der bereits vorhandenen VTE-PTY.
+
+        Bewusst kein subprocess/Pipe: DAR kann Passwort-, Medien- und
+        Slice-Fragen direkt interaktiv im echten Terminal stellen.
+        """
+        if not hasattr(self, "terminal_widget") or not self.terminal_widget:
+            self._show_error("Terminal nicht verfügbar", "Das integrierte Terminal ist nicht verfügbar.")
+            return
+
+        self._append_log_threadsafe("[DAR CREATE]: Neues Archiv wird im interaktiven Terminal gestartet.")
+        self._append_log_threadsafe(f"[DAR CREATE]: {command}")
+        self._append_log_threadsafe(
+            "[DAR CREATE]: Passwörter werden nicht in die Kommandozeile geschrieben; "
+            "DAR fragt sie direkt im Terminal ab."
+        )
+
+        # Ein explizites cd verhindert, dass relative DAR-Referenzen vom
+        # aktuellen Shell-Arbeitsverzeichnis abhängen. Alle übergebenen Pfade
+        # sind bereits absolut und sicher shell-quotiert.
+        cwd = str(Path(options.source).expanduser().resolve())
+        shell_line = f"cd -- {shlex.quote(cwd)} && {command}"
+        self.terminal_widget.terminal.feed_child((shell_line + "\n").encode("utf-8"))
+        self.status_label.set_text("DAR läuft interaktiv im Terminal …")
+        self._force_show_log()
+
     def _open_done(self, dialog, result):
         try:
             file = dialog.open_finish(result)
@@ -1331,43 +1370,52 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                 )
                 return
 
+            # WICHTIG: Alle -g-Selektionspfade werden in EINEN DAR-Aufruf
+            # aufgenommen. Mehrere aufeinanderfolgende Shell-Kommandos wären
+            # bei interaktiven DAR-Prompts gefährlich: Eingaben wie Passwort
+            # oder "Enter für nächstes Slice" könnten sonst vom nächsten
+            # bereits gepufferten Shell-Kommando verschluckt werden.
+            cmd_args = [dar_bin]
+
+            if password:
+                # -K ist der Schlüssel für das eigentliche Archiv, -J wäre
+                # dagegen ausschließlich der Schlüssel des Referenzarchivs.
+                # Bei einem isolierten Katalog ist -A typischerweise ein
+                # unverschlüsselter Katalog; das echte Archiv kann trotzdem
+                # verschlüsselt sein.
+                cmd_args.extend(["-K", password])
+
+            cmd_args.extend([
+                "-x", real_archive_arg,
+                "-A", catalog_arg,
+                "-R", dest_dir,
+            ])
+
+            if not restore_ownership:
+                cmd_args.append("-O")
+
             for path in paths_to_extract:
-                cmd_args = [dar_bin]
-
-                if password:
-                    cmd_args.extend(["-J", password])
-
-                cmd_args.extend([
-                    "-x", real_archive_arg,
-                    "-A", catalog_arg,
-                    "-R", dest_dir,
-                ])
-
-                if not restore_ownership:
-                    cmd_args.append("-O")
-
                 if path:
                     cmd_args.extend(["-g", path])
 
-                # Für die Shell sicher quotieren. Ein Pfad mit Leerzeichen
-                # darf nicht in mehrere Shell-Argumente zerfallen.
-                full_command_str = " ".join(
-                    shlex.quote(str(arg)) for arg in cmd_args
-                )
-
-                self._append_log_threadsafe(
-                    f"[DEBUG EXAKTER BEFEHL]: {full_command_str}"
-                )
-                self._append_log_threadsafe(
-                    f"[EXEC Extraktion direkt im Terminal]: {full_command_str}"
-                )
-
-                self.terminal_widget.terminal.feed_child(
-                    (full_command_str + "\n").encode("utf-8")
-                )
+            full_command_str = " ".join(
+                shlex.quote(str(arg)) for arg in cmd_args
+            )
 
             self._append_log_threadsafe(
-                "[System]: Extraktionsbefehl(e) an das Terminal übergeben."
+                f"[DEBUG EXAKTER BEFEHL]: {full_command_str}"
+            )
+            self._append_log_threadsafe(
+                "[EXEC Extraktion aus isoliertem Katalog direkt im Terminal]: "
+                + full_command_str
+            )
+            self._append_log_threadsafe(
+                "[System]: DAR kann nun fehlende Archiv-Slices/Bänder selbst "
+                "interaktiv im Terminal anfordern."
+            )
+
+            self.terminal_widget.terminal.feed_child(
+                (full_command_str + "\n").encode("utf-8")
             )
 
         except Exception as e:
@@ -1879,4 +1927,3 @@ def main():
 if __name__ == "__main__":
     sys.argv[0] = os.path.abspath(sys.argv[0])
     sys.exit(main())
-
