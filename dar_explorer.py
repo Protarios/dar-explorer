@@ -243,7 +243,13 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.is_tape_active = False
         self.current_dmd_db = None
 
+        # Temporärer isolierter Katalog, der beim Beenden optional gesichert
+        # und anschließend gelöscht wird. Nur von uns erzeugte Kataloge werden
+        # automatisch aufgeräumt; vom Benutzer geöffnete Katalogdateien bleiben erhalten.
+        self.temporary_catalog_path = None
+
         self._build_ui()
+        self.connect("close-request", self._on_close_request)
 
     def check_if_catalog(self, path: str) -> bool:
         file_path = Path(path)
@@ -960,6 +966,9 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                     self._append_log_threadsafe(
                         f"[System]: Isolierter Katalog erfolgreich erstellt: {actual_catalog_path}"
                     )
+                    # Dieser Katalog wurde von DAR Explorer im temporären Cache
+                    # erzeugt und darf beim Beenden optional gelöscht werden.
+                    self.temporary_catalog_path = actual_catalog_path
                     GLib.idle_add(lambda: callback(str(actual_catalog_path)))
                 else:
                     error_output = process.stdout.lower() if process.stdout else ""
@@ -1706,6 +1715,142 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.reload_btn.set_sensitive(True)
         self._update_extract_button()
         self.status_label.set_text(status_msg)
+
+
+    def _on_close_request(self, _window):
+        """Behandelt das Schließen des Fensters und räumt temporäre Kataloge auf."""
+        temp_path = getattr(self, "temporary_catalog_path", None)
+
+        if not temp_path or not Path(temp_path).is_file():
+            return False  # normales GTK-Schließen
+
+        dialog = Gtk.Window(
+            title="Temporären Katalog sichern?",
+            transient_for=self,
+            modal=True,
+        )
+        dialog.set_default_size(520, -1)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        box.set_margin_top(18)
+        box.set_margin_bottom(18)
+        box.set_margin_start(18)
+        box.set_margin_end(18)
+        dialog.set_child(box)
+
+        label = Gtk.Label()
+        label.set_markup(
+            "<b>Es existiert noch ein temporärer isolierter Katalog.</b>\n\n"
+            "Möchtest du ihn vor dem Beenden sichern?\n\n"
+            f"<tt>{GLib.markup_escape_text(str(temp_path))}</tt>"
+        )
+        label.set_wrap(True)
+        label.set_xalign(0)
+        box.append(label)
+
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        button_box.set_halign(Gtk.Align.END)
+        box.append(button_box)
+
+        btn_cancel = Gtk.Button(label="Abbrechen")
+        btn_discard = Gtk.Button(label="Verwerfen und schließen")
+        btn_save = Gtk.Button(label="Sichern...")
+        btn_save.add_css_class("suggested-action")
+
+        button_box.append(btn_cancel)
+        button_box.append(btn_discard)
+        button_box.append(btn_save)
+
+        def finish_close():
+            dialog.close()
+            self._delete_temporary_catalog()
+            self.close()
+
+        def on_cancel(_button):
+            dialog.close()
+
+        def on_discard(_button):
+            finish_close()
+
+        def on_save(_button):
+            save_dialog = Gtk.FileDialog(title="Isolierten Katalog sichern")
+            save_dialog.set_initial_name(Path(temp_path).name)
+
+            def on_save_finished(dialog_obj, result):
+                try:
+                    destination = dialog_obj.save_finish(result)
+                except GLib.Error as e:
+                    # Abbruch des Dateidialogs ist kein Fehler und lässt das
+                    # Hauptfenster geöffnet.
+                    if e.code != 0:
+                        return
+                    return
+                except Exception:
+                    return
+
+                if destination is None:
+                    return
+
+                destination_path = destination.get_path()
+                if not destination_path:
+                    self._show_error(
+                        "Speichern fehlgeschlagen",
+                        "Der ausgewählte Speicherort ist kein lokaler Dateipfad."
+                    )
+                    return
+
+                try:
+                    src = Path(temp_path)
+                    dst = Path(destination_path)
+                    if src.resolve() == dst.resolve():
+                        # Gleiche Datei: nichts kopieren, anschließend trotzdem
+                        # als gesichert behandeln und den temporären Katalog
+                        # entfernen.
+                        pass
+                    else:
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, dst)
+
+                    self._append_log_threadsafe(
+                        f"[System]: Isolierter Katalog gesichert: {dst}"
+                    )
+                    finish_close()
+                except Exception as e:
+                    self._show_error(
+                        "Speichern fehlgeschlagen",
+                        f"Der isolierte Katalog konnte nicht gesichert werden:\n{e}"
+                    )
+
+            save_dialog.save(self, None, on_save_finished)
+
+        btn_cancel.connect("clicked", on_cancel)
+        btn_discard.connect("clicked", on_discard)
+        btn_save.connect("clicked", on_save)
+        dialog.present()
+
+        # Das Fenster bleibt geöffnet, bis der Benutzer eine der Aktionen
+        # ausdrücklich auswählt.
+        return True
+
+    def _delete_temporary_catalog(self):
+        """Löscht ausschließlich den aktuell von DAR Explorer erzeugten Katalog."""
+        temp_path = getattr(self, "temporary_catalog_path", None)
+        if not temp_path:
+            return
+
+        try:
+            path = Path(temp_path)
+            if path.is_file():
+                path.unlink()
+                self._append_log_threadsafe(
+                    f"[System]: Temporärer isolierter Katalog gelöscht: {path}"
+                )
+        except OSError as e:
+            self._append_log_threadsafe(
+                f"[Warnung]: Temporärer isolierter Katalog konnte nicht gelöscht werden: {e}"
+            )
+        finally:
+            self.temporary_catalog_path = None
 
     def _show_error(self, title: str, message: str):
         dialog = Gtk.AlertDialog(message=title, detail=message)
