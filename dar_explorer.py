@@ -402,7 +402,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             pwd = entry.get_text()
             self.archive_password = pwd
             dialog.destroy()
-            self._execute_extraction_with_catalog_reference(real_archive_arg, catalog_path, dest_dir, paths_to_extract, forced_password=pwd)
+            self._execute_extraction_with_catalog_reference(real_archive_arg, catalog_path, dest_dir, paths_to_extract, archive_password=pwd)
 
         def on_cancel(btn):
             dialog.destroy()
@@ -615,6 +615,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.terminal_widget = EmbeddedTerminal()
         term_frame = Gtk.Frame(label="Echtes Terminal")
         term_frame.set_child(self.terminal_widget)
+        self.term_frame = term_frame
         term_frame.set_vexpand(True)
         term_frame.set_hexpand(True)
         self.bottom_paned.set_start_child(term_frame)
@@ -741,6 +742,17 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         def execute_load(target_path, is_cat):
             self.current_archive = target_path
             self.is_current_catalog = is_cat
+
+            # Bei einem isolierten Katalog muss der exakte Katalogpfad erhalten
+            # bleiben. Ein isolierter DAR-Katalog ist z.B.
+            # /tmp/dar-explorer/catalogs/testarchiv.dar.1.dar.
+            # Dieser Pfad darf später nicht aus dem Archivnamen rekonstruiert
+            # oder um .dar-Endungen bereinigt werden.
+            if is_cat:
+                self.current_catalog_path = str(Path(target_path).resolve())
+            else:
+                self.current_catalog_path = None
+
             self.is_tape_active = False
             self.loading = True
             self._gui_file_count = 0
@@ -918,8 +930,37 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                     return
 
                 if process.returncode == 0:
-                    self._append_log_threadsafe("[System]: Isolierter Katalog erfolgreich erstellt.")
-                    GLib.idle_add(lambda: callback(str(catalog_target_path)))
+                    # DAR erzeugt bei -C <name>.dar nicht die Datei <name>.dar,
+                    # sondern den eigentlichen isolierten Katalog als
+                    # <name>.dar.1.dar. Der von uns übergebene Zielname ist
+                    # daher NICHT automatisch der tatsächliche Dateipfad.
+                    generated_catalogs = sorted(
+                        cache_dir.glob(f"{clean_name}.dar.*.dar")
+                    )
+
+                    if generated_catalogs:
+                        actual_catalog_path = generated_catalogs[-1].resolve()
+                    else:
+                        # Fallback für eine eventuell abweichende DAR-Ausgabe.
+                        actual_catalog_path = catalog_target_path.resolve()
+
+                    if not actual_catalog_path.is_file():
+                        self._append_log_threadsafe(
+                            f"[Fehler KATALOG]: DAR meldet Erfolg, aber der erzeugte Katalog wurde nicht gefunden: {actual_catalog_path}"
+                        )
+                        GLib.idle_add(
+                            lambda: self._show_error(
+                                "Katalog nicht gefunden",
+                                "DAR hat den isolierten Katalog nicht unter dem erwarteten Dateinamen erzeugt."
+                            )
+                        )
+                        GLib.idle_add(lambda: callback(None))
+                        return
+
+                    self._append_log_threadsafe(
+                        f"[System]: Isolierter Katalog erfolgreich erstellt: {actual_catalog_path}"
+                    )
+                    GLib.idle_add(lambda: callback(str(actual_catalog_path)))
                 else:
                     error_output = process.stdout.lower() if process.stdout else ""
                     if any(kw in error_output for kw in ["password", "secu_string", "krypt", "auth", "encryption"]):
@@ -1206,72 +1247,91 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         if self.current_archive:
             self.load_archive(self.current_archive)
 
-    def _execute_extraction_with_catalog_reference(self, real_archive_arg, catalog_path, dest_dir, paths_to_extract, archive_password=None, restore_ownership=False):
+    def _execute_extraction_with_catalog_reference(
+        self,
+        real_archive_arg,
+        catalog_path,
+        dest_dir,
+        paths_to_extract,
+        archive_password=None,
+        restore_ownership=False,
+    ):
+        """Extrahiert aus einem echten DAR-Archiv mit einem isolierten Katalog.
+
+        Wichtig:
+        - real_archive_arg ist die DAR-Archivbasis, z.B. /.../testarchiv
+        - catalog_path ist der vollständige isolierte Katalog, z.B.
+          /tmp/dar-explorer/catalogs/testarchiv.dar.1.dar
+        - Der Katalogpfad wird niemals aus dem Archivpfad rekonstruiert und
+          seine .dar/.1.dar-Endungen werden niemals entfernt.
+        """
         self.status_label.set_text("Starte Extraktion direkt im Terminal...")
         self.progress.set_visible(False)
 
-        # 0. Falls real_archive_arg eine file://-URI ist, in einen echten Pfad umwandeln!
-        if real_archive_arg.startswith("file://"):
+        try:
             from urllib.parse import urlparse
             from urllib.request import url2pathname
-            parsed_url = urlparse(real_archive_arg)
-            real_archive_arg = url2pathname(parsed_url.path)
 
-        # 1. Sicherstellen, dass das Terminal-Frame in der UI sichtbar ist
-        if hasattr(self, 'term_frame') and self.term_frame:
-            self.term_frame.set_visible(True)
+            # URI -> lokaler Pfad
+            if real_archive_arg and str(real_archive_arg).startswith("file://"):
+                real_archive_arg = url2pathname(urlparse(str(real_archive_arg)).path)
 
-        try:
+            if catalog_path and str(catalog_path).startswith("file://"):
+                catalog_path = url2pathname(urlparse(str(catalog_path)).path)
+
+            # Bekannte /temp-Fehlinterpretation korrigieren.
+            if catalog_path and str(catalog_path).startswith("/temp/"):
+                catalog_path = str(catalog_path).replace("/temp/", "/tmp/", 1)
+
+            real_archive_arg = str(Path(real_archive_arg).resolve())
+            catalog_arg = str(Path(catalog_path).resolve())
+            dest_dir = str(Path(dest_dir).resolve())
+
+            # Der Katalog MUSS eine konkrete Datei sein.
+            # Ein Verzeichnis darf hier niemals stillschweigend an -A
+            # übergeben werden.
+            catalog_file = Path(catalog_arg)
+            if not catalog_file.is_file():
+                self._append_log_threadsafe(
+                    f"[Fehler KATALOG]: Katalogdatei nicht gefunden: {catalog_arg}"
+                )
+                self._show_error(
+                    "Katalog nicht gefunden",
+                    f"Die isolierte Katalogdatei wurde nicht gefunden:\n{catalog_arg}"
+                )
+                return
+
+            # Das reale Archiv wird als DAR-Basis übergeben. Bei einer
+            # Auswahl testarchiv.1.dar wird daraus /.../testarchiv.
+            self._append_log_threadsafe(
+                f"[DEBUG ARCHIV]: -x {real_archive_arg}"
+            )
+            self._append_log_threadsafe(
+                f"[DEBUG KATALOG]: -A {catalog_arg}"
+            )
+
             dar_bin = get_dar_executable()
 
-            catalog_pwd = getattr(self, 'archive_password', None)
-            current_archive_pwd = archive_password if 'archive_password' in locals() else None
+            # Passwort explizit bevorzugen; ansonsten das aktuell gespeicherte.
+            password = archive_password or getattr(self, "archive_password", None)
 
-            # 1. Sicherstellen, dass catalog_path absolut sauber ist (kein file://, kein /temp/)
-            if catalog_path and catalog_path.startswith("file://"):
-                from urllib.parse import urlparse
-                from urllib.request import url2pathname
-                catalog_path = url2pathname(urlparse(catalog_path).path)
-
-            if catalog_path and catalog_path.startswith("/temp/"):
-                catalog_path = catalog_path.replace("/temp/", "/tmp/", 1)
-
-            p_cat = Path(catalog_path)
-
-            if p_cat.is_dir():
-                archive_name = Path(real_archive_arg).name
-                base_name = re.sub(r'\.dar$', '', archive_name)
-                catalog_arg = str(p_cat / base_name)
-            else:
-                cat_str = str(p_cat)
-                catalog_arg = re.sub(r'\.\d+\.dar$', '', cat_str)
-                catalog_arg = re.sub(r'\.dar$', '', catalog_arg)
-
-            # 2. Doppelte Absicherung: Falls irgendwo ein file:// reingerutscht ist, radikal wegschneiden
-            if catalog_arg.startswith("file://"):
-                catalog_path = url2pathname(urlparse(catalog_arg).path)
-                p_cat = Path(catalog_path)
-                catalog_arg = str(p_cat.parent / re.sub(r'\.dar$', '', p_cat.name))
-                catalog_arg = re.sub(r'\.\d+$', '', catalog_arg)
-
-            # Prüfen, ob das Terminal-Widget bereit ist
-            if not hasattr(self, 'terminal_widget') or not self.terminal_widget:
-                self._show_error("Fehler", "Terminal-Widget ist in der UI nicht verfügbar.")
+            if not hasattr(self, "terminal_widget") or not self.terminal_widget:
+                self._show_error(
+                    "Fehler",
+                    "Terminal-Widget ist in der UI nicht verfügbar."
+                )
                 return
 
             for path in paths_to_extract:
                 cmd_args = [dar_bin]
 
-                if catalog_pwd:
-                    cmd_args.extend(["-J", catalog_pwd])
-
-                if current_archive_pwd:
-                    cmd_args.extend(["-K", current_archive_pwd])
+                if password:
+                    cmd_args.extend(["-J", password])
 
                 cmd_args.extend([
-                    "-x", real_archive_arg,  # Jetzt garantiert ein echter lokaler Pfad!
+                    "-x", real_archive_arg,
                     "-A", catalog_arg,
-                    "-R", str(dest_dir)
+                    "-R", dest_dir,
                 ])
 
                 if not restore_ownership:
@@ -1280,14 +1340,26 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                 if path:
                     cmd_args.extend(["-g", path])
 
-                full_command_str = " ".join(cmd_args)
-                self._append_log_threadsafe(f"[EXEC Extraktion direkt im Terminal]: {full_command_str}")
+                # Für die Shell sicher quotieren. Ein Pfad mit Leerzeichen
+                # darf nicht in mehrere Shell-Argumente zerfallen.
+                full_command_str = " ".join(
+                    shlex.quote(str(arg)) for arg in cmd_args
+                )
 
-                # Befehl in die laufende Bash-Shell des Terminals füttern
-                terminal_cmd = full_command_str + "\n"
-                self.terminal_widget.terminal.feed_child_binary(terminal_cmd.encode('utf-8'))
+                self._append_log_threadsafe(
+                    f"[DEBUG EXAKTER BEFEHL]: {full_command_str}"
+                )
+                self._append_log_threadsafe(
+                    f"[EXEC Extraktion direkt im Terminal]: {full_command_str}"
+                )
 
-            self._append_log_threadsafe("[System]: Extraktionsbefehl(e) an das Terminal übergeben.")
+                self.terminal_widget.terminal.feed_child(
+                    (full_command_str + "\n").encode("utf-8")
+                )
+
+            self._append_log_threadsafe(
+                "[System]: Extraktionsbefehl(e) an das Terminal übergeben."
+            )
 
         except Exception as e:
             self._append_log_threadsafe(f"[Fehler Extraktion]: {e}")
@@ -1344,17 +1416,34 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                                     clean_base_name = re.sub(r'\.dar$', '', clean_base_name)
                                     real_archive_arg = str(file_path.parent / clean_base_name)
 
-                                    catalog_path = None
-                                    for key, val in self.__dict__.items():
-                                        if isinstance(val, (str, Path)) and str(val).endswith(('.dar', 'katalog', 'catalog')) and Path(val).exists():
-                                            catalog_path = str(val)
-                                            break
+                                    # Der beim Laden gespeicherte Pfad ist bereits der
+                                    # vollständige isolierte Katalog, z.B.
+                                    # /tmp/dar-explorer/catalogs/testarchiv.dar.1.dar.
+                                    # NICHT aus dem Archivnamen rekonstruieren und NICHT
+                                    # .dar/.1.dar entfernen.
+                                    catalog_arg = getattr(self, 'current_catalog_path', None)
 
-                                    if not catalog_path:
-                                        catalog_path = getattr(self, 'current_file', None) or getattr(self, 'current_archive_path', None) or "/tmp/dar-explorer/catalogs/"
+                                    if not catalog_arg:
+                                        self._append_log_threadsafe(
+                                            "[Fehler]: Kein Pfad zum aktuell geladenen isolierten Katalog vorhanden."
+                                        )
+                                        self._show_error(
+                                            "Katalogpfad fehlt",
+                                            "Der Pfad des geladenen isolierten Katalogs konnte nicht ermittelt werden."
+                                        )
+                                        return
 
-                                    self._append_log_threadsafe(f"[Debug]: Nutze Katalog-Referenz: {catalog_path}")
-                                    self._ask_for_permissions_mode(destination, paths_to_extract, real_archive_arg, catalog_path)
+                                    catalog_arg = str(Path(catalog_arg).resolve())
+
+                                    self._append_log_threadsafe(
+                                        f"[DEBUG KATALOG]: Exakter -A-Pfad: {catalog_arg}"
+                                    )
+                                    self._ask_for_permissions_mode(
+                                        destination,
+                                        paths_to_extract,
+                                        real_archive_arg,
+                                        catalog_arg
+                                    )
 
                             except Exception as e:
                                 self._append_log_threadsafe(f"Fehler bei der Dateiauswahl: {e}")
@@ -1645,3 +1734,4 @@ def main():
 if __name__ == "__main__":
     sys.argv[0] = os.path.abspath(sys.argv[0])
     sys.exit(main())
+
