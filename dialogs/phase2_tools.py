@@ -6,17 +6,9 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk
 
+from .archive_create import SizeSelector
 
-UNITS = {
-    "KB": 10**3,
-    "MB": 10**6,
-    "GB": 10**9,
-    "TB": 10**12,
-    "KiB": 2**10,
-    "MiB": 2**20,
-    "GiB": 2**30,
-    "TiB": 2**40,
-}
+
 
 
 class Phase2OperationDialog(Gtk.Window):
@@ -66,28 +58,25 @@ class Phase2OperationDialog(Gtk.Window):
             self._browse_button(box, "Zielverzeichnis wählen", self._choose_destination_dir)
 
             if operation in {"isolate", "repair"}:
-                self.password_entry = Gtk.PasswordEntry()
+                # Gtk.PasswordEntry besitzt in der verwendeten GTK4-Version
+                # kein set_placeholder_text(). Für das optionale Passwort ist
+                # ein normales Entry mit unsichtbarer Darstellung ausreichend.
+                self.password_entry = Gtk.Entry()
+                self.password_entry.set_visibility(False)
                 self.password_entry.set_placeholder_text("Optional – leer lassen für interaktive Abfrage")
+                self.password_entry.set_hexpand(True)
                 box.append(Gtk.Label(label="Passwort (optional):", xalign=0))
                 box.append(self.password_entry)
 
             if operation in {"isolate", "repair", "xform"}:
-                size_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
                 box.append(Gtk.Label(label="Slice-Größe:", xalign=0))
-                self.size_entry = Gtk.Entry()
-                self.size_entry.set_text("4")
-                self.size_entry.set_width_chars(10)
-                size_box.append(self.size_entry)
-                self.unit = Gtk.DropDown.new_from_strings(list(UNITS))
-                self.unit.set_selected(6 if operation == "xform" else 5)  # GiB / MiB
-                size_box.append(self.unit)
-                box.append(size_box)
-                self.size_label = Gtk.Label(label="", xalign=0)
-                self.size_label.add_css_class("dim-label")
-                box.append(self.size_label)
-                self.size_entry.connect("changed", self._update_size_label)
-                self.unit.connect("notify::selected", self._update_size_label)
-                self._update_size_label()
+                self.slice_size = SizeSelector()
+                box.append(self.slice_size)
+
+                box.append(Gtk.Label(label="1. Slicegröße (optional):", xalign=0))
+                self.first_slice_size = SizeSelector()
+                self.first_slice_size.set_size("")
+                box.append(self.first_slice_size)
 
         buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         buttons.set_halign(Gtk.Align.END)
@@ -160,26 +149,6 @@ class Phase2OperationDialog(Gtk.Window):
         except Exception:
             pass
 
-    def _update_size_label(self, *_):
-        if not hasattr(self, "size_label"):
-            return
-        try:
-            value = float(self.size_entry.get_text().replace(",", "."))
-            names = list(UNITS)
-            unit = names[self.unit.get_selected()]
-            bytes_value = int(value * UNITS[unit])
-            self.size_label.set_text(f"= {bytes_value:,} Bytes".replace(",", "."))
-        except Exception:
-            self.size_label.set_text("Ungültige Slice-Größe")
-
-    def _size_bytes(self):
-        value = float(self.size_entry.get_text().replace(",", "."))
-        unit = list(UNITS)[self.unit.get_selected()]
-        result = int(value * UNITS[unit])
-        if result <= 0:
-            raise ValueError("Die Slice-Größe muss größer als 0 sein.")
-        return result
-
     def _run_clicked(self, _button):
         try:
             kwargs = {"archive": self.archive_entry.get_text().strip()}
@@ -193,8 +162,10 @@ class Phase2OperationDialog(Gtk.Window):
                 kwargs["destination"] = self.destination_entry.get_text().strip()
                 if hasattr(self, "password_entry"):
                     kwargs["password"] = self.password_entry.get_text() or None
-                if hasattr(self, "size_entry"):
-                    kwargs["slice_size"] = self._size_bytes()
+                if hasattr(self, "slice_size"):
+                    kwargs["slice_size"] = int(self.slice_size.get_bytes_text())
+                    first = self.first_slice_size.get_bytes_text()
+                    kwargs["first_slice_size"] = int(first) if first else None
             self.on_run(self.operation, kwargs)
             self.close()
         except Exception as exc:

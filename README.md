@@ -145,3 +145,7 @@ Für wirklich große Archive würde ich danach nicht einfach weitere Buttons hin
 8. Slice-Übersicht
 9. Detaildialog mit DAR-Metadaten
 10. optionaler Hintergrundindex für sehr große Archive
+
+
+## Phase 3
+See PHASE3.md.

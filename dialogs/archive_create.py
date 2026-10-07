@@ -10,6 +10,7 @@ from dar_backend.capabilities import supported_algorithms, dar_version
 from config.profiles import save_profile, load_profile, list_profiles
 
 
+
 class SizeSelector(Gtk.Box):
     """Compact size editor with an explicit decimal/binary unit dropdown.
 
@@ -115,7 +116,6 @@ class SizeSelector(Gtk.Box):
         self.unit.set_selected(0)
         self.value.set_value(total)
         self._update_label()
-
 
 class ArchiveCreateDialog(Gtk.Window):
     """Modern GTK4/DAR create dialog.

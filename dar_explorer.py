@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import queue
+import sqlite3
 from pathlib import Path
 
 import gi
@@ -108,6 +109,8 @@ class DarNode(GObject.Object):
         group: str = "",
         size: str = "",
         date: str = "",
+        size_bytes: int = 0,
+        timestamp: int = 0,
     ):
         super().__init__()
         self.name = name
@@ -118,6 +121,8 @@ class DarNode(GObject.Object):
         self.group = group
         self.size = size
         self.date = date
+        self.size_bytes = size_bytes
+        self.timestamp = timestamp
         self.children = Gio.ListStore.new(DarNode)
 
     @property
@@ -151,7 +156,9 @@ def build_tree(entries: list[ParsedEntry]):
                     entry.user if is_last else "unknown",
                     entry.group if is_last else "unknown",
                     entry.size if is_last else "—",
-                    entry.date if is_last else "—"
+                    entry.date if is_last else "—",
+                    entry.size_bytes if is_last else 0,
+                    entry.timestamp if is_last else 0,
                 )
                 nodes[current_path] = node
 
@@ -169,6 +176,8 @@ def build_tree(entries: list[ParsedEntry]):
                 node.group = entry.group
                 node.size = entry.size
                 node.date = entry.date
+                node.size_bytes = entry.size_bytes
+                node.timestamp = entry.timestamp
 
             parent_path = current_path
 
@@ -240,6 +249,14 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.loading = False
         self.extracting = False
         self._gui_file_count = 0
+        self._current_nodes = []
+        self._right_model_source = None
+        self._sort_key = "name"
+        self._sort_reverse = False
+        self._type_filter = "all"
+        self._index_enabled = False
+        self._index_thread = None
+        self._index_ready = False
 
         self.is_tape_active = False
         self.current_dmd_db = None
@@ -443,6 +460,10 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         popover.set_child(box)
 
         actions = [
+            ("Integritätsprüfung", "integrity"),
+            ("Slice-Übersicht", "slices"),
+            ("DAR-Metadaten", "metadata"),
+            ("Hintergrundindex aufbauen", "index"),
             ("Archiv testen", "test"),
             ("Archiv / Dateisystem vergleichen", "compare"),
             ("Katalog isolieren", "isolate"),
@@ -457,6 +478,14 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
     def _open_phase2_dialog(self, _button, operation, popover):
         popover.popdown()
+        if operation == "integrity":
+            self._run_integrity_check(); return
+        if operation == "slices":
+            self._show_slice_overview(); return
+        if operation == "metadata":
+            self._show_archive_metadata(); return
+        if operation == "index":
+            self._start_background_index(); return
         dialog = Phase2OperationDialog(self, operation, self.current_archive, self._run_phase2_operation)
         dialog.present()
 
@@ -472,11 +501,11 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             elif operation == "test":
                 cmd = command_test(archive, data.get("isolated_catalog"))
             elif operation == "isolate":
-                cmd = command_isolate(archive, data["destination"], password=data.get("password"), slice_size=data.get("slice_size"))
+                cmd = command_isolate(archive, data["destination"], password=data.get("password"), slice_size=data.get("slice_size"), first_slice_size=data.get("first_slice_size"))
             elif operation == "repair":
-                cmd = command_repair(archive, data["destination"], password=data.get("password"), slice_size=data.get("slice_size"))
+                cmd = command_repair(archive, data["destination"], password=data.get("password"), slice_size=data.get("slice_size"), first_slice_size=data.get("first_slice_size"))
             elif operation == "xform":
-                cmd = command_xform(archive, data["destination"], data["slice_size"])
+                cmd = command_xform(archive, data["destination"], data["slice_size"], first_slice_size=data.get("first_slice_size"))
             else:
                 raise ValueError(f"Unbekannte Phase-2-Operation: {operation}")
 
@@ -519,8 +548,21 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
         self.search = Gtk.SearchEntry()
         self.search.set_placeholder_text("Archiv durchsuchen …")
-        self.search.set_width_chars(30)
+        self.search.set_width_chars(26)
         self.search.connect("search-changed", self.on_search_changed)
+
+        self.filter_dropdown = Gtk.DropDown.new_from_strings(["Alle", "Dateien", "Verzeichnisse"])
+        self.filter_dropdown.set_tooltip_text("Dateityp filtern")
+        self.filter_dropdown.connect("notify::selected", lambda *_: self._on_view_filter_changed())
+
+        self.sort_dropdown = Gtk.DropDown.new_from_strings([
+            "Name ↑", "Name ↓", "Größe ↑", "Größe ↓", "Datum ↑", "Datum ↓"
+        ])
+        self.sort_dropdown.set_tooltip_text("Sortierung")
+        self.sort_dropdown.connect("notify::selected", lambda *_: self._on_sort_changed())
+
+        header.pack_end(self.sort_dropdown)
+        header.pack_end(self.filter_dropdown)
         header.pack_end(self.search)
 
         tools_btn = Gtk.MenuButton(label="DAR-Werkzeuge")
@@ -582,6 +624,10 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         click_controller = Gtk.GestureClick()
         click_controller.connect("pressed", self.on_tree_pressed)
         tree_view.add_controller(click_controller)
+        tree_right_click = Gtk.GestureClick(button=3)
+        tree_right_click.connect("pressed", self._on_tree_context_pressed)
+        tree_view.add_controller(tree_right_click)
+        tree_view.connect("activate", self.on_tree_activate)
 
         tree_scroll = Gtk.ScrolledWindow()
         tree_scroll.set_child(tree_view)
@@ -598,6 +644,10 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self._add_column("Größe", self._size_factory(), 110)
         self._add_column("Datum", self._date_factory(), 190)
         self._add_column("Pfad", self._path_factory(), 500)
+        self.column_view.connect("activate", self.on_right_activate)
+        right_click = Gtk.GestureClick(button=3)
+        right_click.connect("pressed", self._on_right_context_pressed)
+        self.column_view.add_controller(right_click)
 
         right_scroll = Gtk.ScrolledWindow()
         right_scroll.set_min_content_height(400)
@@ -1094,9 +1144,9 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
         if self.root_store.get_n_items() > 0:
             archive_root_node = self.root_store.get_item(0)
-            self.right_selection.set_model(archive_root_node.children)
+            self._set_right_nodes(list(archive_root_node.children))
         else:
-            self.right_selection.set_model(self.root_store)
+            self._set_right_nodes(list(self.root_store))
 
         self.extract_btn.set_sensitive(False)
 
@@ -1150,7 +1200,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             self._apply_search()
         else:
             if hasattr(node, 'children') and node.children is not None:
-                self.right_selection.set_model(node.children)
+                self._set_right_nodes(list(node.children))
 
                 total = node.children.get_n_items()
                 if total == 0:
@@ -1158,7 +1208,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
                 else:
                     self.status_label.set_text(f"{total:,} Einträge in diesem Verzeichnis.".replace(",", "."))
             else:
-                self.right_selection.set_model(Gio.ListStore.new(DarNode))
+                self._set_right_nodes([])
                 self.status_label.set_text("Dieser Ordner ist im Archiv leer.")
 
         self._update_extract_button()
@@ -1223,29 +1273,288 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
     def on_search_changed(self, _entry):
         self._apply_search()
 
-    def _apply_search(self):
-        query = self.search.get_text().strip().casefold()
-
-        if not query:
-            row = self.tree_selection.get_selected_item()
-            if row:
-                node = row.get_item()
-                self.right_selection.set_model(
-                    node.children if node.is_dir else Gio.ListStore.new(DarNode)
-                )
-                self.path_label.set_text(node.path)
-            self._update_extract_button()
-            return
-
+    def _set_right_nodes(self, nodes):
+        self._current_nodes = list(nodes)
         store = Gio.ListStore.new(DarNode)
-        for node in self.all_nodes:
-            if query in f"{node.name} {node.path}".casefold():
-                store.append(node)
+        for node in self._current_nodes:
+            store.append(node)
+        self._right_model_source = store
 
-        self.right_selection.set_model(store)
-        self.path_label.set_text(f"Suche: „{self.search.get_text()}“")
-        self.status_label.set_text(f"{store.get_n_items():,} Treffer".replace(",", "."))
+        def visible(node):
+            query = self.search.get_text().strip().casefold() if hasattr(self, "search") else ""
+            if query and query not in f"{node.name} {node.path}".casefold():
+                return False
+            if self._type_filter == "files" and node.is_dir:
+                return False
+            if self._type_filter == "dirs" and not node.is_dir:
+                return False
+            return True
+
+        filt = Gtk.CustomFilter.new(lambda item: visible(item))
+        filtered = Gtk.FilterListModel.new(store, filt)
+
+        def compare(a, b):
+            key = self._sort_key
+            if key == "size":
+                av, bv = a.size_bytes, b.size_bytes
+            elif key == "date":
+                av, bv = a.timestamp, b.timestamp
+            else:
+                av, bv = a.name.casefold(), b.name.casefold()
+            result = -1 if av < bv else (1 if av > bv else 0)
+            return -result if self._sort_reverse else result
+
+        sorter = Gtk.CustomSorter.new(compare)
+        sorted_model = Gtk.SortListModel.new(filtered, sorter)
+        self.right_selection.set_model(sorted_model)
+        self.status_label.set_text(f"{sorted_model.get_n_items():,} Einträge".replace(",", "."))
         self._update_extract_button()
+
+    def _on_view_filter_changed(self):
+        selected = self.filter_dropdown.get_selected()
+        self._type_filter = ["all", "files", "dirs"][selected if selected < 3 else 0]
+        self._set_right_nodes(self._current_nodes)
+
+    def _on_sort_changed(self):
+        selected = self.sort_dropdown.get_selected()
+        self._sort_key = "name" if selected < 2 else ("size" if selected < 4 else "date")
+        self._sort_reverse = selected in (1, 3, 5)
+        self._set_right_nodes(self._current_nodes)
+
+    def on_search_changed(self, _entry):
+        self._set_right_nodes(self._current_nodes)
+        self.path_label.set_text(f"Suche: „{self.search.get_text()}“" if self.search.get_text().strip() else self.path_label.get_text())
+
+    def _selected_right_nodes(self):
+        result = []
+        model = self.right_selection.get_model()
+        bitset = self.right_selection.get_selection()
+        if not model or not bitset:
+            return result
+        for i in range(model.get_n_items()):
+            if bitset.contains(i):
+                item = model.get_item(i)
+                if item:
+                    result.append(item)
+        return result
+
+    def _navigate_to_node(self, node):
+        if not node or not node.is_dir:
+            return
+        self.search.set_text("")
+        self._set_right_nodes(list(node.children))
+        self.path_label.set_text(node.path or "Archivwurzel")
+        self.status_label.set_text(f"{node.children.get_n_items():,} Einträge".replace(",", "."))
+
+    def on_tree_activate(self, _view, position):
+        row = self.tree_selection.get_model().get_item(position) if self.tree_selection.get_model() else None
+        if row:
+            node = row.get_item()
+            if node and node.is_dir:
+                self._navigate_to_node(node)
+
+    def on_right_activate(self, _view, position):
+        model = self.right_selection.get_model()
+        if not model:
+            return
+        node = model.get_item(position)
+        if not node:
+            return
+        self.right_selection.select_item(position, True)
+        if node.is_dir:
+            self._navigate_to_node(node)
+        else:
+            self._start_direct_extract([node.path])
+
+    def _start_direct_extract(self, paths):
+        if not paths:
+            return
+        dialog = Gtk.FileDialog(title="Zielverzeichnis für Extraktion wählen")
+        dialog.select_folder(self, None, lambda d, r: self._finish_direct_extract(d, r, paths))
+
+    def _finish_direct_extract(self, dialog, result, paths):
+        try:
+            folder = dialog.select_folder_finish(result)
+            if not folder:
+                return
+            self._ask_for_permissions_mode(folder.get_path(), paths)
+        except Exception as exc:
+            self._show_error("Extraktion", str(exc))
+
+    def _context_popover(self, node=None, selected=None, anchor=None):
+        pop = Gtk.Popover()
+        pop.set_parent(anchor or self.column_view)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_margin_top(6); box.set_margin_bottom(6); box.set_margin_start(6); box.set_margin_end(6)
+        pop.set_child(box)
+        selected = selected or ([node] if node else [])
+        if selected:
+            b = Gtk.Button(label="Extrahieren")
+            b.connect("clicked", lambda *_: (pop.popdown(), self._start_direct_extract([n.path for n in selected])))
+            box.append(b)
+            if len(selected) == 1 and selected[0].is_dir:
+                b2 = Gtk.Button(label="Verzeichnis öffnen")
+                b2.connect("clicked", lambda *_: (pop.popdown(), self._navigate_to_node(selected[0])))
+                box.append(b2)
+            b3 = Gtk.Button(label="Details…")
+            b3.connect("clicked", lambda *_: (pop.popdown(), self._show_node_details(selected[0])))
+            box.append(b3)
+        b4 = Gtk.Button(label="Alle Einträge dieses Ordners auswählen")
+        b4.connect("clicked", lambda *_: (pop.popdown(), self._select_all_visible()))
+        box.append(b4)
+        pop.popup()
+
+    def _on_right_context_pressed(self, gesture, n_press, x, y):
+        if n_press != 1:
+            return
+        selected = self._selected_right_nodes()
+        self._context_popover(selected=selected, anchor=self.column_view)
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+    def _on_tree_context_pressed(self, gesture, n_press, x, y):
+        if n_press != 1:
+            return
+        row = self.tree_selection.get_selected_item()
+        node = row.get_item() if row else None
+        self._context_popover(node=node, anchor=self.column_view)
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+    def _select_all_visible(self):
+        model = self.right_selection.get_model()
+        if model:
+            self.right_selection.select_all()
+
+    def _show_node_details(self, node):
+        dialog = Gtk.Window(title="Dateidetails", transient_for=self, modal=True)
+        dialog.set_default_size(620, 430)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_margin_top(16); box.set_margin_bottom(16); box.set_margin_start(16); box.set_margin_end(16)
+        dialog.set_child(box)
+        text = Gtk.TextView(); text.set_editable(False); text.set_monospace(True); text.set_vexpand(True)
+        buf = text.get_buffer()
+        buf.set_text("\n".join([
+            f"Name:        {node.name}", f"Pfad:        {node.path}", f"Typ:         {node.type_text}",
+            f"Größe:       {node.size}", f"Datum:       {node.date}", f"Berechtigungen:{node.permissions}",
+            f"Benutzer:    {node.user}", f"Gruppe:      {node.group}",
+            "", f"Archiv:      {self.current_archive or '—'}",
+        ]))
+        scroll=Gtk.ScrolledWindow(); scroll.set_child(text); box.append(scroll)
+        close=Gtk.Button(label="Schließen"); close.set_halign(Gtk.Align.END); close.connect("clicked", lambda *_: dialog.close()); box.append(close)
+        dialog.present()
+
+    def _show_archive_metadata(self, _button=None):
+        if not self.current_archive:
+            return
+        dialog = Gtk.Window(title="DAR-Metadaten", transient_for=self, modal=True)
+        dialog.set_default_size(760, 560)
+        box=Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8); box.set_margin_top(12); box.set_margin_bottom(12); box.set_margin_start(12); box.set_margin_end(12); dialog.set_child(box)
+        text=Gtk.TextView(); text.set_editable(False); text.set_monospace(True); text.set_vexpand(True)
+        scroll=Gtk.ScrolledWindow(); scroll.set_child(text); box.append(scroll)
+        close=Gtk.Button(label="Schließen"); close.set_halign(Gtk.Align.END); close.connect("clicked", lambda *_: dialog.close()); box.append(close)
+        text.get_buffer().set_text("Lese DAR-Metadaten …")
+        def worker():
+            try:
+                cmd=[get_dar_executable(), "-l", normalize_archive_argument(self.current_archive)]
+                if self.archive_password:
+                    cmd.extend(["-K", self.archive_password])
+                proc=subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env={**os.environ,"LC_ALL":"C","LANG":"C"})
+                out=proc.stdout or ""
+            except Exception as exc:
+                out=f"Fehler: {exc}"
+            GLib.idle_add(text.get_buffer().set_text, out[-30000:] if len(out)>30000 else out)
+        threading.Thread(target=worker, daemon=True).start(); dialog.present()
+
+    def _index_path(self):
+        if not self.current_archive:
+            return None
+        import hashlib
+        p=Path(normalize_archive_argument(self.current_archive))
+        try:
+            st=p.stat()
+            key=f"{p.resolve()}|{st.st_mtime_ns}|{st.st_size}".encode()
+        except OSError:
+            key=str(p.resolve()).encode()
+        digest=hashlib.sha256(key).hexdigest()
+        root=Path.home()/".cache"/"dar-explorer"/"index"
+        root.mkdir(parents=True, exist_ok=True)
+        return root/f"{digest}.sqlite"
+
+    def _start_background_index(self, _button=None):
+        if not self.all_nodes or not self.current_archive or self._index_thread and self._index_thread.is_alive():
+            return
+        self._index_enabled=True
+        index_path=self._index_path()
+        if not index_path:
+            return
+        nodes=list(self.all_nodes)
+        self.progress.set_visible(True); self.progress.set_fraction(0.0); self.progress.set_text("Baue Hintergrundindex …")
+        self.status_label.set_text("Hintergrundindex wird erstellt …")
+        def worker():
+            try:
+                con=sqlite3.connect(index_path)
+                con.execute("CREATE TABLE IF NOT EXISTS entries (path TEXT PRIMARY KEY, name TEXT, is_dir INTEGER, size_bytes INTEGER, timestamp INTEGER, permissions TEXT, user TEXT, group_name TEXT)")
+                con.execute("DELETE FROM entries")
+                total=max(1,len(nodes))
+                for i,n in enumerate(nodes,1):
+                    con.execute("INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?,?,?)",(n.path,n.name,int(n.is_dir),int(n.size_bytes),int(n.timestamp),n.permissions,n.user,n.group))
+                    if i%250==0 or i==total:
+                        GLib.idle_add(self.progress.set_fraction,i/total)
+                        GLib.idle_add(self.progress.set_text,f"Index: {i}/{total} ({int(i/total*100)}%)")
+                con.commit(); con.close()
+                self._index_ready=True
+                GLib.idle_add(self.status_label.set_text,f"Hintergrundindex bereit: {index_path}")
+            except Exception as exc:
+                GLib.idle_add(self.status_label.set_text,f"Hintergrundindex fehlgeschlagen: {exc}")
+            finally:
+                GLib.idle_add(self.progress.set_visible,False)
+        self._index_thread=threading.Thread(target=worker,daemon=True); self._index_thread.start()
+
+    def _show_integrity_result(self, ok, output):
+        title="Integritätsprüfung erfolgreich" if ok else "Integritätsprüfung fehlgeschlagen"
+        dialog=Gtk.Window(title=title, transient_for=self, modal=True); dialog.set_default_size(760,520)
+        box=Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8); box.set_margin_top(12); box.set_margin_bottom(12); box.set_margin_start(12); box.set_margin_end(12); dialog.set_child(box)
+        label=Gtk.Label(label="Das Archiv wurde ohne DAR-Fehler geprüft." if ok else "DAR meldet einen Fehler beim Prüfen des Archivs."); label.set_xalign(0); label.set_wrap(True); box.append(label)
+        text=Gtk.TextView(); text.set_editable(False); text.set_monospace(True); text.set_vexpand(True); text.get_buffer().set_text(output[-30000:]); scroll=Gtk.ScrolledWindow(); scroll.set_child(text); box.append(scroll)
+        close=Gtk.Button(label="Schließen"); close.set_halign(Gtk.Align.END); close.connect("clicked", lambda *_: dialog.close()); box.append(close); dialog.present()
+
+    def _run_integrity_check(self, _button=None):
+        if not self.current_archive or self.loading or self.extracting: return
+        self._force_show_log(); self.progress.set_visible(True); self.progress.pulse(); self.progress.set_text("Prüfe Archivintegrität …")
+        archive=self.current_archive
+        def worker():
+            try:
+                cmd=[get_dar_executable(), "-t", normalize_archive_argument(archive)]
+                proc=subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env={**os.environ,"LC_ALL":"C","LANG":"C"})
+                out=proc.stdout or ""; ok=proc.returncode==0
+            except Exception as exc:
+                out=str(exc); ok=False
+            GLib.idle_add(self.progress.set_visible, False)
+            GLib.idle_add(self.status_label.set_text, "Integritätsprüfung erfolgreich." if ok else "Integritätsprüfung fehlgeschlagen.")
+            GLib.idle_add(self._show_integrity_result, ok, out)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_slice_overview(self, _button=None):
+        if not self.current_archive: return
+        base=normalize_archive_argument(self.current_archive)
+        p=Path(base); directory=p.parent; stem=p.name
+        rows=[]
+        for f in sorted(directory.glob(stem+".*.dar")):
+            m=re.search(r"\.(\d+)\.dar$", f.name)
+            if m:
+                rows.append((int(m.group(1)), f, f.stat().st_size))
+        rows.sort()
+        max_no=rows[-1][0] if rows else 0
+        present={n for n,_,_ in rows}
+        missing=[n for n in range(1,max_no+1) if n not in present]
+        dialog=Gtk.Window(title="Slice-Übersicht", transient_for=self, modal=True); dialog.set_default_size(720,520)
+        box=Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8); box.set_margin_top(12); box.set_margin_bottom(12); box.set_margin_start(12); box.set_margin_end(12); dialog.set_child(box)
+        summary=f"Archiv: {base}\nVorhanden: {len(rows)} Slices" + (f"\nFehlend: {', '.join(map(str,missing))}" if missing else "\nKeine Lücken erkannt.")
+        lab=Gtk.Label(label=summary); lab.set_xalign(0); lab.set_selectable(True); box.append(lab)
+        view=Gtk.TextView(); view.set_editable(False); view.set_monospace(True); view.set_vexpand(True)
+        lines=[f"{'Slice':>8}  {'Größe':>16}  Datei"]
+        for n,f,size in rows: lines.append(f"{n:>8}  {size:>16,}  {f.name}".replace(",","."))
+        view.get_buffer().set_text("\n".join(lines)); scroll=Gtk.ScrolledWindow(); scroll.set_child(view); box.append(scroll)
+        close=Gtk.Button(label="Schließen"); close.set_halign(Gtk.Align.END); close.connect("clicked", lambda *_: dialog.close()); box.append(close); dialog.present()
 
     def on_open_clicked(self, _button):
         dialog = Gtk.FileDialog()
@@ -1577,7 +1886,9 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         if paths_to_extract == [""]:
             total_expected_files = len(self.all_nodes)
         else:
-            total_expected_files = len(paths_to_extract)
+            selected = {p.rstrip("/") for p in paths_to_extract if p}
+            total_expected_files = sum(1 for n in self.all_nodes if any(n.path == p or n.path.startswith(p + "/") for p in selected))
+            total_expected_files = max(total_expected_files, len(paths_to_extract))
 
         self.progress.set_fraction(0.0)
         self.progress.set_text(f"Starte Extraktion ({total_expected_files} Elemente)...")

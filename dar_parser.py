@@ -20,6 +20,8 @@ class ParsedEntry:
     group: str
     size: str
     date: str
+    size_bytes: int = 0
+    timestamp: int = 0
 
 def normalize_archive_argument(path: str) -> str:
     path = os.path.expanduser(path)
@@ -27,60 +29,98 @@ def normalize_archive_argument(path: str) -> str:
     m = re.match(r"^(.*)\.(\d+)\.dar$", path)
     return m.group(1) if m else path
 
-def format_size(size_val: str | int) -> str:
+def parse_size_bytes(size_val: str | int | float | None) -> int:
+    """Convert DAR's (possibly localized) size representation to bytes.
+
+    DAR may emit localized units such as ``o``, ``Ko``, ``Mo`` and ``Go``
+    (French ``octet`` notation), as well as the English/German forms B, KB,
+    MB, ... .  Never pass these strings directly to ``int()``.
     """
-    Konvertiert Byte-Zahlen oder vorgefertigte Größen-Strings in kompaktes,
-    gut lesbares Format (z.B. '12 K', '13.5 G').
+    if size_val is None:
+        return 0
+    if isinstance(size_val, (int, float)):
+        return max(0, int(size_val))
+
+    raw = str(size_val).replace("\u00a0", " ").strip()
+    if not raw or raw == "—":
+        return 0
+
+    # Number + optional unit.  Accept decimal comma/dot and French/German
+    # thousands separators.  DAR's localized output commonly uses forms like
+    # ``17 o``, ``2 Ko``, ``1,5 Mo`` or ``1.234,5 Mo``.
+    m = re.match(r"^\s*([+-]?(?:\d+(?:[.,]\d+)?|\d{1,3}(?:[. ]\d{3})+(?:,\d+)?))\s*([A-Za-z]+)?\s*$", raw)
+    if not m:
+        digits = re.sub(r"[^0-9]", "", raw)
+        return int(digits) if digits else 0
+
+    number = m.group(1).replace(" ", "")
+    unit = (m.group(2) or "B").lower()
+
+    if "," in number and "." in number:
+        # German/French form: 1.234,5
+        number = number.replace(".", "").replace(",", ".")
+    elif "," in number:
+        number = number.replace(",", ".")
+
+    try:
+        value = float(number)
+    except ValueError:
+        return 0
+
+    # DAR/localized forms.  ``o`` = octet, ``ko/mo/go/to`` = powers of 1024
+    # in DAR's traditional size formatting.  Also accept SI and IEC spellings.
+    multipliers = {
+        "b": 1, "o": 1, "octet": 1, "octets": 1,
+        "k": 1024, "ko": 1024, "kio": 1024, "kib": 1024, "kb": 1000,
+        "m": 1024**2, "mo": 1024**2, "mio": 1024**2, "mib": 1024**2, "mb": 1000**2,
+        "g": 1024**3, "go": 1024**3, "gio": 1024**3, "gib": 1024**3, "gb": 1000**3,
+        "t": 1024**4, "to": 1024**4, "tio": 1024**4, "tib": 1024**4, "tb": 1000**4,
+        "p": 1024**5, "po": 1024**5, "pio": 1024**5, "pib": 1024**5, "pb": 1000**5,
+        "mio": 1_000_000, "mrd": 1_000_000_000,
+    }
+    # Long German localized forms.
+    multipliers.update({
+        "milliarde": 1_000_000_000, "milliarden": 1_000_000_000,
+    })
+
+    multiplier = multipliers.get(unit)
+    if multiplier is None:
+        # Unknown unit: try the numeric part only rather than crashing the GUI.
+        return max(0, int(value))
+    return max(0, int(value * multiplier))
+
+
+def format_size(size_val: str | int | float) -> str:
+    """Return a consistent human-readable size using B/KB/MB/GB/TB.
+
+    The internal calculation uses 1024-byte steps, matching DAR's traditional
+    binary size display, but deliberately uses the familiar ``KB/MB/GB`` labels
+    instead of DAR's abbreviated ``K/M/G`` output.
     """
-    if not size_val or size_val == "—":
-        return "—"
-
-    # Falls der Wert als String vorliegt, bereinigen und versuchen als Zahl zu interpretieren
-    if isinstance(size_val, str):
-        raw = size_val.strip()
-        if not raw:
-            return "0 B"
-
-        # Falls "Mio" oder "Milliard" aus lokalisierter dar-Ausgabe kommt
-        if "mio" in raw.lower():
-            raw = re.sub(r"[^\d,\.]", "", raw).replace(",", ".")
-            try:
-                bytes_num = float(raw) * 1_000_000
-            except ValueError:
-                return size_val
-        elif "mrd" in raw.lower() or "milliarde" in raw.lower():
-            raw = re.sub(r"[^\d,\.]", "", raw).replace(",", ".")
-            try:
-                bytes_num = float(raw) * 1_000_000_000
-            except ValueError:
-                return size_val
-        else:
-            # Versuche reine Ziffern zu extrahieren
-            clean_str = re.sub(r"[^\d]", "", raw)
-            if not clean_str:
-                return raw
-            bytes_num = int(clean_str)
-    else:
-        bytes_num = int(size_val)
-
+    bytes_num = parse_size_bytes(size_val)
     if bytes_num <= 0:
-        return "0 B"
+        return "0 B" if size_val not in (None, "", "—") else "—"
 
-    # Umrechnung in Einheiten B, K, M, G, T
-    units = ["B", "K", "M", "G", "T", "P"]
-    val = float(bytes_num)
-    unit_idx = 0
+    units = ("B", "KB", "MB", "GB", "TB", "PB")
+    value = float(bytes_num)
+    idx = 0
+    while value >= 1024.0 and idx < len(units) - 1:
+        value /= 1024.0
+        idx += 1
 
-    while val >= 1024.0 and unit_idx < len(units) - 1:
-        val /= 1024.0
-        unit_idx += 1
+    if idx == 0:
+        return f"{int(value)} B"
+    formatted = f"{value:.1f}".rstrip("0").rstrip(".")
+    return f"{formatted} {units[idx]}"
 
-    if unit_idx == 0:
-        return f"{int(val)} B"
-
-    # Eine Nachkommastelle bei Fließkommazahlen, z.B. 13.5 G
-    formatted = f"{val:.1f}".rstrip("0").rstrip(".")
-    return f"{formatted} {units[unit_idx]}"
+def parse_timestamp(timestamp_str: str | int | None) -> int:
+    """Konvertiert einen Unix-Timestamp; ungültige DAR-Werte werden zu 0."""
+    if timestamp_str is None:
+        return 0
+    try:
+        return int(timestamp_str)
+    except (ValueError, TypeError):
+        return 0
 
 
 def format_date(timestamp_str: str) -> str:
@@ -164,7 +204,9 @@ def run_dar_listing(path: str, password_callback=None, progress_callback=None, e
                             permissions=elem.attrib.get("permissions", "-rw-r----"),
                             user=elem.attrib.get("user", "unknown"), group=elem.attrib.get("group", "unknown"),
                             size=format_size(elem.attrib.get("size", "0")),
-                            date=format_date(elem.attrib.get("date", "—"))
+                            date=format_date(elem.attrib.get("date", "—")),
+                            size_bytes=parse_size_bytes(elem.attrib.get("size", "0")),
+                            timestamp=parse_timestamp(elem.attrib.get("date", "0")),
                         ))
                 elif event == "end":
                     if tag == "Directory" and name and path_stack and path_stack[-1] == name:
