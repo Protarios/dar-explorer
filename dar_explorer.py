@@ -23,6 +23,11 @@ gi.require_version("Vte", "3.91")
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango, Vte
 
 from dar_parser import ParsedEntry, normalize_archive_argument, run_dar_listing
+from dar_backend.operations import (
+    command_compare, command_isolate, command_repair, command_test, command_xform,
+    shell_command,
+)
+from dialogs.phase2_tools import Phase2OperationDialog
 from dar_backend.archive import ArchiveCreateOptions
 from dialogs.archive_create import ArchiveCreateDialog
 
@@ -227,12 +232,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.set_default_size(1450, 850)
         self.set_title("DAR Explorer V2")
 
-        try:
-            from config_manager import load_config
-            self.config = load_config()
-        except ImportError:
-            self.config = {"slice_lager_path": os.path.expanduser("~/mein_band_archiv")}
-
         self.current_archive = None
         self.archive_password = None
         self.is_current_catalog = False
@@ -435,55 +434,59 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
     def reset_archive_banner(self):
         GLib.idle_add(self.archive_status_right_label.set_markup, "<span color='gray'>Kein Archiv/Katalog geladen</span>")
 
-    def _build_config_popover(self, menu_button):
+    def _build_tools_popover(self, menu_button):
         popover = Gtk.Popover()
         menu_button.set_popover(popover)
-
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        box.set_margin_top(10)
-        box.set_margin_bottom(10)
-        box.set_margin_start(12)
-        box.set_margin_end(12)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(8); box.set_margin_bottom(8)
+        box.set_margin_start(8); box.set_margin_end(8)
         popover.set_child(box)
 
-        lbl = Gtk.Label()
-        lbl.set_markup("<b>Teilarchiv-Lager (Bandspeicher)</b>")
-        lbl.set_xalign(0)
-        box.append(lbl)
+        actions = [
+            ("Archiv testen", "test"),
+            ("Archiv / Dateisystem vergleichen", "compare"),
+            ("Katalog isolieren", "isolate"),
+            ("Unterbrochenes Archiv reparieren", "repair"),
+            ("Slices mit dar_xform umformen", "xform"),
+        ]
+        for label, operation in actions:
+            button = Gtk.Button(label=label)
+            button.set_halign(Gtk.Align.FILL)
+            button.connect("clicked", self._open_phase2_dialog, operation, popover)
+            box.append(button)
 
-        current_path = self.config.get("slice_lager_path", "")
-        self.config_path_label = Gtk.Label(label=current_path)
-        self.config_path_label.set_xalign(0)
-        self.config_path_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
-        self.config_path_label.set_width_chars(35)
-        self.config_path_label.add_css_class("dim-label")
-        box.append(self.config_path_label)
+    def _open_phase2_dialog(self, _button, operation, popover):
+        popover.popdown()
+        dialog = Phase2OperationDialog(self, operation, self.current_archive, self._run_phase2_operation)
+        dialog.present()
 
-        change_path_btn = Gtk.Button(label="Ordner ändern...")
-        change_path_btn.connect("clicked", self.on_change_config_path_clicked, popover)
-        box.append(change_path_btn)
+    def _run_phase2_operation(self, operation, data):
+        archive = data.get("archive", "")
+        if operation in {"repair", "xform", "isolate"} and self.is_current_catalog:
+            self._show_error("Nicht auf isoliertem Katalog", "Für diese Operation muss ein echtes DAR-Archiv geöffnet sein.")
+            return
 
-    def on_change_config_path_clicked(self, _btn, popover):
-        dialog = Gtk.FileDialog(title="Ordner für Teilarchive wählen")
+        try:
+            if operation == "compare":
+                cmd = command_compare(archive, data["filesystem_root"])
+            elif operation == "test":
+                cmd = command_test(archive, data.get("isolated_catalog"))
+            elif operation == "isolate":
+                cmd = command_isolate(archive, data["destination"], password=data.get("password"), slice_size=data.get("slice_size"))
+            elif operation == "repair":
+                cmd = command_repair(archive, data["destination"], password=data.get("password"), slice_size=data.get("slice_size"))
+            elif operation == "xform":
+                cmd = command_xform(archive, data["destination"], data["slice_size"])
+            else:
+                raise ValueError(f"Unbekannte Phase-2-Operation: {operation}")
 
-        def on_folder_selected(dialog_obj, result):
-            try:
-                folder = dialog_obj.select_folder_finish(result)
-                if folder:
-                    new_path = folder.get_path()
-                    if new_path:
-                        self.config["slice_lager_path"] = new_path
-                        self.config_path_label.set_text(new_path)
-
-                        from config_manager import save_config
-                        save_config(self.config)
-                        self._append_log_threadsafe(f"[Config]: Speicherort für Slices geändert auf: {new_path}")
-            except Exception as e:
-                self._append_log_threadsafe(f"[Config]: Fehler bei der Pfadauswahl: {e}")
-            finally:
-                popover.popdown()
-
-        dialog.select_folder(self, None, on_folder_selected)
+            command = shell_command(cmd)
+            self._append_log_threadsafe(f"[PHASE 2] {command}")
+            self._force_show_log()
+            self.status_label.set_text("DAR-Operation läuft im Terminal …")
+            self.terminal_widget.terminal.feed_child((command + "\n").encode("utf-8"))
+        except Exception as exc:
+            self._show_error("DAR Explorer", str(exc))
 
     def _build_ui(self):
         header = Gtk.HeaderBar()
@@ -520,11 +523,10 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.search.connect("search-changed", self.on_search_changed)
         header.pack_end(self.search)
 
-        config_btn = Gtk.MenuButton()
-        config_btn.set_icon_name("emblem-system")
-        config_btn.set_tooltip_text("Einstellungen")
-        self._build_config_popover(config_btn)
-        header.pack_end(config_btn)
+        tools_btn = Gtk.MenuButton(label="DAR-Werkzeuge")
+        tools_btn.set_tooltip_text("Phase-2-DAR-Operationen")
+        self._build_tools_popover(tools_btn)
+        header.pack_end(tools_btn)
 
         self.archive_label = Gtk.Label(label="Kein Archiv geöffnet")
         self.archive_label.set_xalign(0)

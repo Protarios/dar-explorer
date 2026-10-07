@@ -1,40 +1,34 @@
 #!/usr/bin/env python3
-"""
-DAR Explorer V2 - Konfigurations-Manager.
-Speichert und lädt Einstellungen dauerhaft in einer JSON-Datei.
+"""Persistente DAR-Explorer-Konfiguration.
+
+Teilarchiv-Lager ist bewusst keine Einstellung mehr: Slices werden über die
+normalen Datei-/Verzeichnisdialoge und DARs interaktive Medienabfragen behandelt.
 """
 
-import os
 import json
 from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".config" / "dar-explorer"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+DEFAULT_CONFIG: dict = {}
 
-DEFAULT_CONFIG = {
-    "slice_lager_path": str(Path.home() / "mein_band_archiv")
-}
 
 def load_config() -> dict:
-    """Lädt die Konfiguration oder erstellt die Standardwerte, falls nicht vorhanden."""
     if not CONFIG_FILE.exists():
-        save_config(DEFAULT_CONFIG)
-        return DEFAULT_CONFIG
+        return {}
     try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            config = json.load(f)
-            for key, val in DEFAULT_CONFIG.items():
-                if key not in config:
-                    config[key] = val
-            return config
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        # Alte Einstellung beim Laden automatisch entfernen.
+        data.pop("slice_lager_path", None)
+        return data
     except Exception:
-        return DEFAULT_CONFIG
+        return {}
+
 
 def save_config(config_data: dict):
-    """Speichert die übergebenen Konfigurationsdaten sicher ab."""
-    try:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config_data, f, indent=4, ensure_ascii=False)
-    except Exception as e:
-        print(f"[Config] Fehler beim Speichern der Konfiguration: {e}")
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    clean = dict(config_data or {})
+    clean.pop("slice_lager_path", None)
+    CONFIG_FILE.write_text(json.dumps(clean, indent=4, ensure_ascii=False), encoding="utf-8")

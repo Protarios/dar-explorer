@@ -10,6 +10,113 @@ from dar_backend.capabilities import supported_algorithms, dar_version
 from config.profiles import save_profile, load_profile, list_profiles
 
 
+class SizeSelector(Gtk.Box):
+    """Compact size editor with an explicit decimal/binary unit dropdown.
+
+    The widget keeps the exact value in bytes internally.  DAR receives the
+    resulting byte count, so there is no ambiguity about whether MB/GB means
+    powers of 1000 or powers of 1024.  Existing DAR strings such as 4G or
+    700M are accepted when loading old profiles.
+    """
+
+    UNITS = [
+        ("B", 1),
+        ("KB", 10**3),
+        ("MB", 10**6),
+        ("GB", 10**9),
+        ("TB", 10**12),
+        ("KiB", 2**10),
+        ("MiB", 2**20),
+        ("GiB", 2**30),
+        ("TiB", 2**40),
+    ]
+
+    def __init__(self, placeholder="optional"):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.set_hexpand(True)
+
+        self.value = Gtk.SpinButton.new(
+            Gtk.Adjustment(value=4, lower=0, upper=10**12, step_increment=1, page_increment=10),
+            1,
+            3,
+        )
+        self.value.set_numeric(True)
+        self.value.set_hexpand(True)
+        self.value.set_width_chars(10)
+        self.value.set_tooltip_text("Größe als Zahl eingeben")
+        self.append(self.value)
+
+        self.unit = Gtk.DropDown.new_from_strings([u[0] for u in self.UNITS])
+        self.unit.set_selected(6)  # GiB
+        self.unit.set_size_request(105, -1)
+        self.unit.set_tooltip_text("Einheit auswählen")
+        self.append(self.unit)
+
+        self.bytes_label = Gtk.Label()
+        self.bytes_label.set_xalign(0)
+        self.bytes_label.set_width_chars(22)
+        self.bytes_label.add_css_class("dim-label")
+        self.append(self.bytes_label)
+
+        self.placeholder = placeholder
+        self.value.connect("value-changed", self._changed)
+        self.unit.connect("notify::selected", self._changed)
+        self._update_label()
+
+    def _factor(self):
+        idx = self.unit.get_selected()
+        return self.UNITS[idx][1] if idx < len(self.UNITS) else 1
+
+    def _changed(self, *_args):
+        self._update_label()
+
+    def _update_label(self):
+        raw = self.value.get_value()
+        size = int(round(raw * self._factor()))
+        if size <= 0:
+            self.bytes_label.set_text("—")
+            return
+        self.bytes_label.set_text(f"= {size:,} Byte".replace(",", "."))
+
+    def get_bytes_text(self):
+        size = int(round(self.value.get_value() * self._factor()))
+        return str(size) if size > 0 else ""
+
+    def set_size(self, text):
+        text = (text or "").strip()
+        if not text:
+            self.value.set_value(0)
+            self._update_label()
+            return
+
+        # Old profiles used DAR suffixes.  Interpret them exactly as DAR 2.8.x
+        # does by default (binary units), then represent the result explicitly
+        # in bytes.
+        import re
+        m = re.fullmatch(r"(\d+(?:[.,]\d+)?)\s*([kKmMgGtT]?)", text)
+        if not m:
+            self.value.set_value(0)
+            self._update_label()
+            return
+        number = float(m.group(1).replace(",", "."))
+        suffix = m.group(2).upper()
+        factors = {"": 1, "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}
+        total = int(round(number * factors[suffix]))
+
+        # Prefer a clean integer representation in the most suitable binary
+        # unit, falling back to bytes when it is not an exact multiple.
+        for idx in range(8, -1, -1):
+            factor = self.UNITS[idx][1]
+            if total >= factor and total % factor == 0:
+                self.unit.set_selected(idx)
+                self.value.set_value(total / factor)
+                self._update_label()
+                return
+        self.unit.set_selected(0)
+        self.value.set_value(total)
+        self._update_label()
+
+
 class ArchiveCreateDialog(Gtk.Window):
     """Modern GTK4/DAR create dialog.
 
@@ -124,9 +231,10 @@ class ArchiveCreateDialog(Gtk.Window):
         slice_frame.set_child(sb); content.append(slice_frame)
         self.slice = Gtk.CheckButton(label="Archiv in Slices aufteilen")
         sb.append(self.slice)
-        self.slice_size = Gtk.Entry(); self.slice_size.set_placeholder_text("z. B. 4G, 700M, 20G")
+        self.slice_size = SizeSelector()
         sb.append(self._row("Slicegröße", self.slice_size))
-        self.first_slice = Gtk.Entry(); self.first_slice.set_placeholder_text("optional")
+        self.first_slice = SizeSelector()
+        self.first_slice.set_size("")
         sb.append(self._row("1. Slicegröße", self.first_slice))
         self.slice_size.set_sensitive(False); self.first_slice.set_sensitive(False)
         self.slice.connect("toggled", lambda w: (self.slice_size.set_sensitive(w.get_active()), self.first_slice.set_sensitive(w.get_active())))
@@ -188,8 +296,8 @@ class ArchiveCreateDialog(Gtk.Window):
             compression=comp,
             compression_level=int(self.level.get_value()),
             slice_enabled=self.slice.get_active(),
-            slice_size=self.slice_size.get_text().strip(),
-            first_slice_size=self.first_slice.get_text().strip(),
+            slice_size=self.slice_size.get_bytes_text(),
+            first_slice_size=self.first_slice.get_bytes_text(),
             empty_dirs=self.empty_dirs.get_active(),
             hard_links=self.hardlinks.get_active(),
             sparse_files=self.sparse.get_active(),
@@ -253,6 +361,6 @@ class ArchiveCreateDialog(Gtk.Window):
         comp_values = ["none"] + comps
         if o.compression in comp_values: self.compression.set_selected(comp_values.index(o.compression))
         self.level.set_value(o.compression_level)
-        self.slice.set_active(o.slice_enabled); self.slice_size.set_text(o.slice_size); self.first_slice.set_text(o.first_slice_size)
+        self.slice.set_active(o.slice_enabled); self.slice_size.set_size(o.slice_size); self.first_slice.set_size(o.first_slice_size)
         self.empty_dirs.set_active(o.empty_dirs); self.hardlinks.set_active(o.hard_links); self.sparse.set_active(o.sparse_files)
         self.xattrs.set_active(o.xattrs); self.acl.set_active(o.acl); self.numeric.set_active(o.numeric_owner)

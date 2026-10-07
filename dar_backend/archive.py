@@ -95,8 +95,13 @@ def build_create_argv(options: ArchiveCreateOptions, dar_binary: str = "dar") ->
 
     compression = options.compression.strip().lower()
     if compression and compression not in {"none", "keine", "uncompressed"}:
-        level = max(0, min(9, int(options.compression_level)))
-        args += ["-z", f"{compression}:{level}"]
+        level = int(options.compression_level)
+        max_level = 22 if compression == "zstd" else 9
+        level = max(1, min(max_level, level))
+        # DAR 2.8.x treats the argument of -z as an optional argument when
+        # GNU getopt is available. It must therefore be attached to -z;
+        # otherwise e.g. ``-z gzip:6`` makes ``gzip:6`` look like a user target.
+        args.append(f"-z{compression}:{level}")
 
     # Diese Metadaten werden von DAR standardmäßig entsprechend seiner
     # Plattform-/Dateisystemunterstützung behandelt. Wir erzeugen hier
