@@ -42,3 +42,30 @@ class LtfsBackendTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class ManualTapeActionsTests(unittest.TestCase):
+    def test_device_list(self):
+        from ltfs_backend.operations import build_device_list_command
+        self.assertEqual(build_device_list_command(executable="/usr/bin/ltfs"),
+                         ["/usr/bin/ltfs", "-o", "device_list"])
+
+    def test_status_command(self):
+        from ltfs_backend.operations import build_tape_status_command
+        self.assertEqual(build_tape_status_command("/dev/nst0", executable="/usr/bin/mt"),
+                         ["/usr/bin/mt", "-f", "/dev/nst0", "status"])
+
+    def test_eject_command(self):
+        from ltfs_backend.operations import build_tape_eject_command
+        self.assertEqual(build_tape_eject_command("/dev/nst1", executable="/usr/bin/mt"),
+                         ["/usr/bin/mt", "-f", "/dev/nst1", "offline"])
+
+    def test_tape_device_is_not_sg(self):
+        from ltfs_backend.operations import validate_tape_device
+        for device in ("/dev/sg3", "relative", "-f /dev/nst0", "/dev/nst0\nrm -rf /", ""):
+            with self.subTest(device=device), self.assertRaises(ValueError):
+                validate_tape_device(device)
+
+    def test_tape_device_by_id(self):
+        from ltfs_backend.operations import validate_tape_device
+        self.assertEqual(validate_tape_device("/dev/tape/by-id/scsi-35000-nst"),
+                         "/dev/tape/by-id/scsi-35000-nst")

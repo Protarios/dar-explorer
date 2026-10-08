@@ -80,3 +80,46 @@ def filesystem_at(mountpoint: str, *, mountinfo: str | None = None) -> str | Non
 
 def is_ltfs_filesystem(fs_type: str | None) -> bool:
     return bool(fs_type and "ltfs" in fs_type.casefold())
+
+
+def build_device_list_command(*, executable: str | None = None) -> list[str]:
+    """LTFS-eigene Geräteauflistung; liest kein vorhandenes Bandarchiv."""
+    binary = executable or ltfs_executable()
+    if not binary:
+        raise FileNotFoundError("'ltfs' ist nicht installiert oder nicht im PATH.")
+    return [binary, "-o", "device_list"]
+
+
+def validate_tape_device(device: str) -> str:
+    """Linux-Tape-Device für mt, getrennt vom LTFS-SG-Device.
+
+    Ein Gerät wie /dev/sg3 wird bewusst abgewiesen. Das Benutzerfeld darf
+    alternativ einen persistenten Symlink unter /dev/tape/by-id enthalten.
+    """
+    import re
+    value = device.strip()
+    if any(c in value for c in "\n\r\x00"):
+        raise ValueError("Ungültiger Name des mt-Geräts.")
+    if not (re.fullmatch(r"/dev/nst\d+(?:[lma])?", value)
+            or re.fullmatch(r"/dev/tape/by-id/[A-Za-z0-9_.:-]+", value)):
+        raise ValueError("Für mt bitte /dev/nst0 oder einen Symlink /dev/tape/by-id/... verwenden (nicht /dev/sgX).")
+    return value
+
+
+def mt_executable() -> str | None:
+    return shutil.which("mt")
+
+
+def build_tape_status_command(device: str, *, executable: str | None = None) -> list[str]:
+    binary = executable or mt_executable()
+    if not binary:
+        raise FileNotFoundError("'mt' ist nicht installiert oder nicht im PATH (z. B. Paket mt-st).")
+    return [binary, "-f", validate_tape_device(device), "status"]
+
+
+def build_tape_eject_command(device: str, *, executable: str | None = None) -> list[str]:
+    """Nur manueller Aufruf nach bestätigtem abgeschlossenem LTFS-Unmount."""
+    binary = executable or mt_executable()
+    if not binary:
+        raise FileNotFoundError("'mt' ist nicht installiert oder nicht im PATH (z. B. Paket mt-st).")
+    return [binary, "-f", validate_tape_device(device), "offline"]

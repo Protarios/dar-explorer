@@ -1024,3 +1024,52 @@ Die Schaltflächen verwenden normale LTFS-/FUSE-Kommandos (`ltfs -o devname=… 
 **Aktuelle Grenze:** Die Anwendung kann die DAR-Bandwechselaufforderung derzeit nicht zuverlässig aus dem Terminal erkennen. Die Koordination bleibt daher absichtlich manuell. Ein erfolgreicher Mount/Unmount ist erst auf einem realen LTFS-Laufwerk verifizierbar; hier wurden ausschließlich die Python-Kommandos getestet.
 
 Falls Mount oder Unmount fehlschlägt, lässt sich der gesperrte Schalter über **Status / Freigabe** erst nach einer gesonderten Bestätigung zurücksetzen.
+
+### LTFS – vollständige manuelle Bedienung (Ausbaustufe 2)
+
+Die LTFS-Bedienung liegt ausschließlich im separaten LTFS-Terminal. DAR läuft
+währenddessen unabhängig weiter und kann auf eine Medienabfrage warten.
+
+1. **Laufwerke ermitteln:** „LTFS-Laufwerke anzeigen“ sendet `ltfs -o device_list`
+   an das LTFS-Terminal. Gerät wie `/dev/sg3` bzw. eine unterstützte Seriennummer
+   in **LTFS-Laufwerk** eintragen. Der Gerätename für `mt` ist davon zu
+   unterscheiden: oft `/dev/nst0`. Beide müssen demselben physischen Laufwerk
+   entsprechen. „Laufwerksstatus (mt)“ ist nur bei nicht aktivem LTFS freigegeben.
+2. **Mountpoint vorbereiten:** absoluten Verzeichnispfad angeben. Die
+   Schaltfläche „Mountpoint anlegen“ erzeugt ihn mit eigenen Benutzerrechten,
+   ohne `sudo`, und greift nicht auf das Band zu. Fehlende Berechtigungen müssen
+   außerhalb der Anwendung administrativ eingerichtet werden.
+3. **Einstellungen speichern:** Speichert die drei Eingaben in
+   `~/.config/dar-explorer/config.json`. Die Umgebungsvariablen
+   `DAR_EXPLORER_LTFS_DEVICE`, `DAR_EXPLORER_LTFS_TAPE_DEVICE` und
+   `DAR_EXPLORER_LTFS_MOUNTPOINT` können diese Vorgaben beim Start übersteuern.
+4. **Band mounten:** „1. Band mounten“ startet LTFS in der LTFS-Shell; den
+   tatsächlichen Erfolg im Terminal sowie den gemeldeten Mountstatus prüfen.
+5. **DAR schreibt Slices:** im DAR-Terminal das Ziel im LTFS-Mountpoint angeben.
+   Der Bandwechsel darf erst erfolgen, wenn DAR wirklich auf das **nächste**
+   Slice wartet und nicht mehr auf das alte Band schreibt.
+6. **Aushängen:** „2. Band aushängen“ erfordert eine explizite Bestätigung und
+   sendet einen regulären FUSE-Unmount ins **LTFS-Terminal**. Keinesfalls
+   einen erzwungenen/lazy Unmount verwenden. Auch wenn der Mountpoint bereits
+   verschwunden ist, warten, bis **LTFS selbst** seine Index-Schreibarbeiten
+   und den Prozessabschluss im Terminal beendet hat.
+7. **Freigeben:** „3. Status / Abschluss bestätigen“ erst nach Kontrolle des
+   tatsächlichen LTFS-Abschlusses wählen. Ab diesem Zeitpunkt ist ein
+   manueller Bandwechsel zulässig. „Band auswerfen (mt)“ ist optional:
+   `mt -f /dev/nstX offline` (spult zurück und entlädt bei unterstütztem
+   Laufwerk). Das erfordert nochmals eine explizite Bestätigung.
+8. **Neues Band:** manuell einsetzen, mit „1. Band mounten“ einhängen, Erfolg
+   prüfen und **erst danach** die DAR-Abfrage in dessen eigenem Terminal
+   bestätigen.
+
+**Schutz:** Gerät und Mountpoint sind während aktiver LTFS-Prozesse gesperrt.
+Ein versehentliches Schließen der Anwendung während LTFS-Mount oder -Unmount
+wird verhindert, um den Index nicht zu gefährden. Hardwareoperationen sind
+noch nicht auf realer Tape-Hardware getestet. „Laufwerksstatus (mt)“ und
+„Band auswerfen (mt)“ verwenden ausdrücklich **nicht** das LTFS-SG-Gerät.
+Formatieren/Neuinitialisieren von Medien (`mkltfs`/`unltfs`) ist hier bewusst
+nicht implementiert, weil es vorhandene Daten zerstören kann.
+
+Nach dem optionalen `mt offline` erscheint eine weitere Statussperre: Erst
+wenn der Befehl im LTFS-Terminal beendet ist, über „Status / Abschluss
+bestätigen“ den Bandwechsel freigeben.

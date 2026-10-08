@@ -33,8 +33,10 @@ from dar_backend.archive import ArchiveCreateOptions
 from dialogs.archive_create import ArchiveCreateDialog
 from ltfs_backend.operations import (
     build_mount_command, build_unmount_command, filesystem_at, is_ltfs_filesystem,
-    validate_mountpoint,
+    validate_mountpoint, build_device_list_command, build_tape_status_command,
+    build_tape_eject_command,
 )
+from config_manager import load_config, save_config
 
 
 def get_dar_manager_executable() -> str | None:
@@ -273,6 +275,9 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self._ltfs_mount_pending = False
         self._ltfs_unmount_pending = False
         self._ltfs_unmount_requested = False
+        self._ltfs_unmount_confirmed = False
+        self._ltfs_eject_pending = False
+        self._ltfs_config = load_config()
         self._build_ui()
         GLib.timeout_add_seconds(2, self._refresh_ltfs_mount_state)
         self.connect("close-request", self._on_close_request)
@@ -733,46 +738,69 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self._install_css()
 
     def _build_ltfs_panel(self):
-        """Eigene LTFS-Bedienung über ein unabhängiges interaktives Terminal."""
+        """Manuelle LTFS-Schritte, sämtlich auf einem eigenen VTE/PTTY-Kanal."""
         panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        panel.set_margin_top(6)
-        panel.set_margin_start(6)
-        panel.set_margin_end(6)
-        panel.set_margin_bottom(6)
+        for side in ("top", "start", "end", "bottom"):
+            getattr(panel, f"set_margin_{side}")(6)
 
-        config = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        config = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
         panel.append(config)
-
-        device_label = Gtk.Label(label="Bandlaufwerk:")
-        config.append(device_label)
+        config.append(Gtk.Label(label="LTFS-Laufwerk:"))
         self.ltfs_device_entry = Gtk.Entry()
         self.ltfs_device_entry.set_placeholder_text("z. B. /dev/sg3")
-        self.ltfs_device_entry.set_text(os.environ.get("DAR_EXPLORER_LTFS_DEVICE", ""))
-        self.ltfs_device_entry.set_width_chars(17)
+        self.ltfs_device_entry.set_text(os.environ.get(
+            "DAR_EXPLORER_LTFS_DEVICE", self._ltfs_config.get("ltfs_device", "")))
+        self.ltfs_device_entry.set_width_chars(14)
         self.ltfs_device_entry.set_hexpand(True)
         config.append(self.ltfs_device_entry)
 
-        mount_label = Gtk.Label(label="Mountpoint:")
-        config.append(mount_label)
+        config.append(Gtk.Label(label="mt-Gerät:"))
+        self.ltfs_tape_entry = Gtk.Entry()
+        self.ltfs_tape_entry.set_placeholder_text("z. B. /dev/nst0")
+        self.ltfs_tape_entry.set_text(os.environ.get(
+            "DAR_EXPLORER_LTFS_TAPE_DEVICE", self._ltfs_config.get("ltfs_tape_device", "")))
+        self.ltfs_tape_entry.set_width_chars(14)
+        self.ltfs_tape_entry.set_hexpand(True)
+        config.append(self.ltfs_tape_entry)
+
+        config.append(Gtk.Label(label="Mountpoint:"))
         self.ltfs_mount_entry = Gtk.Entry()
-        self.ltfs_mount_entry.set_text(os.environ.get("DAR_EXPLORER_LTFS_MOUNTPOINT", "/mnt/ltfs"))
-        self.ltfs_mount_entry.set_width_chars(24)
+        self.ltfs_mount_entry.set_text(os.environ.get(
+            "DAR_EXPLORER_LTFS_MOUNTPOINT", self._ltfs_config.get("ltfs_mountpoint", "/mnt/ltfs")))
+        self.ltfs_mount_entry.set_width_chars(22)
         self.ltfs_mount_entry.set_hexpand(True)
         self.ltfs_mount_entry.connect("changed", lambda *_: self._refresh_ltfs_mount_state())
         config.append(self.ltfs_mount_entry)
+        save = Gtk.Button(label="Einstellungen speichern")
+        save.connect("clicked", self._on_ltfs_save_settings)
+        config.append(save)
+
+        discovery = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        panel.append(discovery)
+        self.ltfs_list_button = Gtk.Button(label="LTFS-Laufwerke anzeigen")
+        self.ltfs_list_button.connect("clicked", self._on_ltfs_list_devices)
+        discovery.append(self.ltfs_list_button)
+        self.ltfs_mkdir_button = Gtk.Button(label="Mountpoint anlegen")
+        self.ltfs_mkdir_button.connect("clicked", self._on_ltfs_create_mountpoint)
+        discovery.append(self.ltfs_mkdir_button)
+        self.ltfs_tape_status_button = Gtk.Button(label="Laufwerksstatus (mt)")
+        self.ltfs_tape_status_button.connect("clicked", self._on_ltfs_tape_status)
+        discovery.append(self.ltfs_tape_status_button)
+        self.ltfs_eject_button = Gtk.Button(label="Band auswerfen (mt)")
+        self.ltfs_eject_button.connect("clicked", self._on_ltfs_eject)
+        discovery.append(self.ltfs_eject_button)
 
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         panel.append(actions)
-        self.ltfs_mount_button = Gtk.Button(label="Band mounten")
+        self.ltfs_mount_button = Gtk.Button(label="1. Band mounten")
         self.ltfs_mount_button.connect("clicked", self._on_ltfs_mount_clicked)
         actions.append(self.ltfs_mount_button)
-        self.ltfs_unmount_button = Gtk.Button(label="Band aushängen")
+        self.ltfs_unmount_button = Gtk.Button(label="2. Band aushängen")
         self.ltfs_unmount_button.connect("clicked", self._on_ltfs_unmount_clicked)
         actions.append(self.ltfs_unmount_button)
-        refresh = Gtk.Button(label="Status / Freigabe")
-        refresh.connect("clicked", self._on_ltfs_status_clicked)
-        actions.append(refresh)
-
+        self.ltfs_refresh_button = Gtk.Button(label="3. Status / Abschluss bestätigen")
+        self.ltfs_refresh_button.connect("clicked", self._on_ltfs_status_clicked)
+        actions.append(self.ltfs_refresh_button)
         self.ltfs_status_label = Gtk.Label(label="LTFS-Status wird geprüft …")
         self.ltfs_status_label.set_xalign(0)
         self.ltfs_status_label.set_hexpand(True)
@@ -780,21 +808,93 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         actions.append(self.ltfs_status_label)
 
         explanation = Gtk.Label(
-            label="Bandwechsel nur, wenn DAR auf das nächste Slice wartet. "
-                  "Nach dem Aushängen vollständigen LTFS-Abschluss abwarten."
+            label="Manueller Bandwechsel: DAR muss auf das nächste Slice warten → "
+                  "LTFS aushängen → Terminal-Abschluss prüfen und bestätigen → "
+                  "gegebenenfalls Band auswerfen/wechseln → neues Band mounten → "
+                  "erst danach DAR im DAR-Terminal fortsetzen. "
+                  "Die Geräte /dev/sgX (LTFS) und /dev/nstX (mt) sind unterschiedlich."
         )
         explanation.set_wrap(True)
         explanation.set_xalign(0)
         explanation.add_css_class("dim-label")
         panel.append(explanation)
-
         self.ltfs_terminal_widget.set_vexpand(True)
         panel.append(self.ltfs_terminal_widget)
         self._refresh_ltfs_mount_state()
         return panel
 
+    def _on_ltfs_save_settings(self, _button):
+        try:
+            mountpoint = validate_mountpoint(self.ltfs_mount_entry.get_text())
+            data = load_config()
+            data.update({
+                "ltfs_device": self.ltfs_device_entry.get_text().strip(),
+                "ltfs_tape_device": self.ltfs_tape_entry.get_text().strip(),
+                "ltfs_mountpoint": mountpoint,
+            })
+            save_config(data)
+            self.ltfs_status_label.set_text("LTFS-Geräteeinstellungen gespeichert")
+        except (ValueError, OSError) as exc:
+            self._show_error("LTFS-Einstellungen", str(exc))
+
+    def _on_ltfs_list_devices(self, _button):
+        try:
+            self._ltfs_send_command(shlex.join(build_device_list_command()))
+        except FileNotFoundError as exc:
+            self._show_error("Geräteauflistung nicht möglich", str(exc))
+
+    def _on_ltfs_create_mountpoint(self, _button):
+        try:
+            mountpoint = validate_mountpoint(self.ltfs_mount_entry.get_text())
+            if filesystem_at(mountpoint) is not None:
+                raise ValueError("Der Mountpoint ist bereits belegt.")
+            if os.path.islink(mountpoint):
+                raise ValueError("Symlinks als Mountpoint werden nicht unterstützt.")
+            Path(mountpoint).mkdir(parents=True, exist_ok=True)
+            self.ltfs_status_label.set_text(f"Mountpoint vorhanden: {mountpoint}")
+            self._refresh_ltfs_mount_state()
+        except (ValueError, OSError) as exc:
+            self._show_error("Mountpoint konnte nicht angelegt werden", str(exc))
+
+    def _on_ltfs_tape_status(self, _button):
+        try:
+            self._ltfs_send_command(shlex.join(build_tape_status_command(
+                self.ltfs_tape_entry.get_text())))
+        except (ValueError, FileNotFoundError) as exc:
+            self._show_error("Bandlaufwerksstatus nicht möglich", str(exc))
+
+    def _on_ltfs_eject(self, _button):
+        """Manuelles mt offline nur nach bestätigtem LTFS-Abschluss."""
+        try:
+            if not self._ltfs_unmount_confirmed:
+                raise ValueError("Erst das vollständige Aushängen bestätigen.")
+            if filesystem_at(validate_mountpoint(self.ltfs_mount_entry.get_text())) is not None:
+                raise ValueError("Mountpoint ist noch belegt; Auswerfen verboten.")
+            command = build_tape_eject_command(self.ltfs_tape_entry.get_text())
+        except (ValueError, FileNotFoundError) as exc:
+            self._show_error("Band kann nicht ausgeworfen werden", str(exc))
+            return
+        dialog = Gtk.MessageDialog(
+            transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.NONE, text="LTFS abgeschlossen – Band auswerfen?",
+            secondary_text=("Nur bestätigen, wenn LTFS im eigenen Terminal vollständig "
+                            "beendet ist und der Index auf Band geschrieben wurde. "
+                            "mt offline spult gegebenenfalls zurück und entlädt das Band."),
+        )
+        dialog.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Band auswerfen", Gtk.ResponseType.OK)
+        def on_response(dlg, response_id):
+            dlg.destroy()
+            if response_id == Gtk.ResponseType.OK:
+                self._ltfs_eject_pending = True
+                self._ltfs_unmount_confirmed = False
+                self._ltfs_send_command(shlex.join(command))
+                self._refresh_ltfs_mount_state()
+        dialog.connect("response", on_response)
+        dialog.present()
+
     def _refresh_ltfs_mount_state(self):
-        """Mount-Zustand nur über /proc/self/mountinfo, niemals per Tape-Zugriff."""
+        """Regelmäßige Mount-Erkennung nur über Mountinfo; kein Zugriff aufs Tape."""
         if not hasattr(self, "ltfs_mount_entry") or not hasattr(self, "ltfs_status_label"):
             return True
         mountpoint = self.ltfs_mount_entry.get_text().strip()
@@ -802,6 +902,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             self.ltfs_status_label.set_text("Absoluten Mountpoint angeben")
             self.ltfs_mount_button.set_sensitive(False)
             self.ltfs_unmount_button.set_sensitive(False)
+            self.ltfs_eject_button.set_sensitive(False)
             return True
         fs_type = filesystem_at(mountpoint)
         if fs_type is None:
@@ -809,32 +910,52 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             if self._ltfs_mount_pending:
                 message = "LTFS-Mount angefordert – Terminal prüfen"
             elif self._ltfs_unmount_requested:
-                message = "Nicht gemountet – LTFS-Abschluss im Terminal prüfen!"
+                message = "Ausgehängt – LTFS-Prozessabschluss prüfen und bestätigen!"
+            elif self._ltfs_eject_pending:
+                message = "mt offline läuft – Abschluss im LTFS-Terminal bestätigen"
+            elif self._ltfs_unmount_confirmed:
+                message = "LTFS abgeschlossen – Bandwechsel möglich"
             else:
                 message = "Nicht gemountet"
-            self.ltfs_status_label.set_text(message)
-            self.ltfs_mount_button.set_sensitive(
-                not self._ltfs_mount_pending and not self._ltfs_unmount_requested
-            )
-            self.ltfs_unmount_button.set_sensitive(False)
         elif is_ltfs_filesystem(fs_type):
             self._ltfs_mount_pending = False
+            self._ltfs_unmount_confirmed = False
             message = ("LTFS-Unmount angefordert – Terminal prüfen" if self._ltfs_unmount_pending
                        else f"LTFS gemountet ({fs_type})")
-            self.ltfs_status_label.set_text(message)
-            self.ltfs_mount_button.set_sensitive(False)
-            self.ltfs_unmount_button.set_sensitive(not self._ltfs_unmount_pending)
         else:
-            self.ltfs_status_label.set_text(f"Fremdes Dateisystem: {fs_type} – nicht aushängen")
-            self.ltfs_mount_button.set_sensitive(False)
-            self.ltfs_unmount_button.set_sensitive(False)
+            self._ltfs_unmount_confirmed = False
+            message = f"Fremdes Dateisystem: {fs_type} – nicht aushängen"
+        self.ltfs_status_label.set_text(message)
+        pending = (self._ltfs_mount_pending or self._ltfs_unmount_requested
+                   or self._ltfs_eject_pending)
+        busy = fs_type is not None or pending
+        for entry in (self.ltfs_device_entry, self.ltfs_mount_entry):
+            entry.set_sensitive(not busy)
+        self.ltfs_mount_button.set_sensitive(fs_type is None and not pending)
+        self.ltfs_unmount_button.set_sensitive(
+            is_ltfs_filesystem(fs_type) and not self._ltfs_unmount_pending)
+        self.ltfs_mkdir_button.set_sensitive(not busy)
+        self.ltfs_list_button.set_sensitive(not busy)
+        # mt darf während LTFS-Mount/-Unmount nicht ans Laufwerk.
+        self.ltfs_tape_entry.set_sensitive(not busy)
+        self.ltfs_tape_status_button.set_sensitive(not busy)
+        self.ltfs_eject_button.set_sensitive(
+            fs_type is None and not pending and self._ltfs_unmount_confirmed)
         return True
 
     def _on_ltfs_status_clicked(self, _button):
         """Status prüfen; Freigabe nach dem Unmount nur ausdrücklich bestätigen."""
         mountpoint = self.ltfs_mount_entry.get_text().strip()
         fs_type = filesystem_at(mountpoint) if mountpoint else None
-        if self._ltfs_unmount_requested and fs_type is None:
+        if self._ltfs_eject_pending and fs_type is None:
+            title = "Ist das Band vollständig ausgeworfen?"
+            detail = ("Im LTFS-Terminal kontrollieren, ob mt offline beendet ist "
+                      "und das Band physisch entladen wurde. Erst dann "
+                      "darf ein neues Band eingelegt/gemountet werden.")
+            reset = "Auswerfen abgeschlossen"
+            def release():
+                self._ltfs_eject_pending = False
+        elif self._ltfs_unmount_requested and fs_type is None:
             title = "Ist LTFS vollständig beendet?"
             detail = (
                 "Die Mount-Tabelle enthält das LTFS-Dateisystem nicht mehr. "
@@ -846,6 +967,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             def release():
                 self._ltfs_unmount_requested = False
                 self._ltfs_unmount_pending = False
+                self._ltfs_unmount_confirmed = True
         elif self._ltfs_mount_pending and fs_type is None:
             title = "Fehlgeschlagenen Mount zurücksetzen?"
             detail = (
@@ -866,6 +988,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             def release():
                 self._ltfs_unmount_pending = False
                 self._ltfs_unmount_requested = False
+                self._ltfs_unmount_confirmed = False
         else:
             self._refresh_ltfs_mount_state()
             return
@@ -908,6 +1031,8 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             )
             shell_line = shlex.join(command) + " &"
             self._ltfs_unmount_requested = False
+            self._ltfs_unmount_confirmed = False
+            self._ltfs_eject_pending = False
             self._ltfs_mount_pending = True
             self._ltfs_send_command(shell_line)
             self._refresh_ltfs_mount_state()
@@ -2322,6 +2447,20 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
     def _on_close_request(self, _window):
         """Behandelt das Schließen des Fensters und räumt temporäre Kataloge auf."""
+        # Verhindert versehentliches Beenden der LTFS-Shell, solange ein
+        # Dateisystem gemountet ist oder LTFS noch den Index abschließt.
+        if hasattr(self, "ltfs_mount_entry"):
+            mountpoint = self.ltfs_mount_entry.get_text().strip()
+            mounted = filesystem_at(mountpoint) if mountpoint else None
+            if (mounted is not None or self._ltfs_mount_pending
+                    or self._ltfs_unmount_requested or self._ltfs_eject_pending):
+                self._show_error(
+                    "LTFS ist noch aktiv",
+                    "Vor dem Schließen LTFS im eigenen Terminal sauber aushängen und "
+                    "den vollständigen Abschluss über 'Status / Abschluss bestätigen' freigeben. "
+                    "Ein vorzeitiges Beenden kann den Bandindex gefährden."
+                )
+                return True
         temp_path = getattr(self, "temporary_catalog_path", None)
 
         if not temp_path or not Path(temp_path).is_file():
