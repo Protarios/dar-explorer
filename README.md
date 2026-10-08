@@ -986,3 +986,41 @@ Dadurch kann der Explorer sowohl für gewöhnliche lokale Backups als auch spät
 Der aktuelle Entwicklungsstand bildet die grundlegenden DAR-Funktionen und den Umgang mit vollständigen, geslicten und unvollständigen Archiven bereits ab.
 
 Die Entwicklung erfolgt schrittweise nach den definierten Phasen. Funktionen späterer Phasen werden bewusst nicht vorgezogen, damit die grundlegenden Archivoperationen zunächst stabil abgeschlossen werden.
+
+---
+
+# LTFS-Integration (erste Ausbaustufe)
+
+DAR Explorer besitzt **zwei voneinander unabhängige VTE-Terminals** als Reiter im unteren Fensterbereich:
+
+- **DAR-Terminal:** bisherige DAR-Kommandos, inklusive interaktiver Rückfragen zum nächsten Slice.
+- **LTFS-Terminal:** separate Shell/PTY für Mount, Unmount und weitere LTFS-Kommandos.
+
+Die Terminals laufen parallel. Ein Wechsel des Reiters unterbricht die gerade laufende Operation nicht. Auch das bestehende DAR-Ausgabelog bleibt unverändert.
+
+## Einrichtung
+
+LTFS muss separat installiert und für das Bandlaufwerk eingerichtet sein. Die Anwendung überprüft vor dem Mounten, ob der Befehl `ltfs` verfügbar ist. Das eingetragene **Bandlaufwerk** ist beispielsweise `/dev/sg3` (je nach LTFS-Version auch Laufwerksseriennummer); den korrekten Gerätenamen muss man am eigenen System ermitteln. Das Mount-Verzeichnis, beispielsweise `/mnt/ltfs`, muss bereits existieren. Das Programm führt **keine** automatische Formatierung durch und nutzt **kein** `sudo`.
+
+Optional lassen sich Vorgabewerte beim Programmstart über Umgebungsvariablen setzen:
+
+```sh
+export DAR_EXPLORER_LTFS_DEVICE=/dev/sg3
+export DAR_EXPLORER_LTFS_MOUNTPOINT=/mnt/ltfs
+./run.sh
+```
+
+## Bedienung / Bandwechsel
+
+1. Im Reiter **LTFS-Terminal** ein formatiertes LTFS-Band einlegen, Gerät und Mountpoint angeben und **Band mounten** anklicken. Der LTFS-Befehl wird in der separaten Shell im Hintergrund gestartet, damit die Shell auch beim Unmount bedienbar bleibt.
+2. Bei der Archiv-Erstellung als Archivziel den **LTFS-Mountpoint** wählen und das Slicing aktivieren. DAR arbeitet weiterhin im eigenen Terminal.
+3. **Erst wenn DAR das aktuelle Slice vollständig abgeschlossen hat und auf das nächste Band wartet**, im LTFS-Reiter **Band aushängen** aufrufen. Die Sicherheitsabfrage bestätigt, dass DAR nicht mehr auf das Medium schreibt.
+4. **Nicht unmittelbar das Band entnehmen:** `umount` kann zurückkehren, während der LTFS-Prozess noch die Metadaten auf dem Band abschließt. Die Ausgabe des LTFS-Terminals und die vollständig abgeschlossene Abmeldung des Bandlaufwerks abwarten. Die Anzeige „Nicht gemountet“ allein ist **kein** sicheres Eject-Signal.
+5. Nach vollständigem LTFS-Abschluss über **Status / Freigabe** explizit bestätigen, dass LTFS beendet ist. Erst dann das Band physisch wechseln, ein neues Band einlegen, **Band mounten** wählen und den erfolgreichen Mount prüfen.
+6. Erst dann im **DAR-Terminal** die wartende DAR-Abfrage bestätigen.
+
+Die Schaltflächen verwenden normale LTFS-/FUSE-Kommandos (`ltfs -o devname=… MOUNTPOINT`; `fusermount3 -u`, ersatzweise `fusermount -u` oder `umount`). **Kein** Force-/Lazy-Unmount und **kein** automatisches Auswerfen, Formatieren oder Überschreiben. Ein Mountpoint mit einem anderen Dateisystem wird nicht ausgehängt.
+
+**Aktuelle Grenze:** Die Anwendung kann die DAR-Bandwechselaufforderung derzeit nicht zuverlässig aus dem Terminal erkennen. Die Koordination bleibt daher absichtlich manuell. Ein erfolgreicher Mount/Unmount ist erst auf einem realen LTFS-Laufwerk verifizierbar; hier wurden ausschließlich die Python-Kommandos getestet.
+
+Falls Mount oder Unmount fehlschlägt, lässt sich der gesperrte Schalter über **Status / Freigabe** erst nach einer gesonderten Bestätigung zurücksetzen.

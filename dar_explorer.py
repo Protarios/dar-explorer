@@ -31,6 +31,10 @@ from dar_backend.operations import (
 from dialogs.phase2_tools import Phase2OperationDialog, RepairDialog
 from dar_backend.archive import ArchiveCreateOptions
 from dialogs.archive_create import ArchiveCreateDialog
+from ltfs_backend.operations import (
+    build_mount_command, build_unmount_command, filesystem_at, is_ltfs_filesystem,
+    validate_mountpoint,
+)
 
 
 def get_dar_manager_executable() -> str | None:
@@ -266,7 +270,11 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         # automatisch aufgeräumt; vom Benutzer geöffnete Katalogdateien bleiben erhalten.
         self.temporary_catalog_path = None
 
+        self._ltfs_mount_pending = False
+        self._ltfs_unmount_pending = False
+        self._ltfs_unmount_requested = False
         self._build_ui()
+        GLib.timeout_add_seconds(2, self._refresh_ltfs_mount_state)
         self.connect("close-request", self._on_close_request)
 
     def check_if_catalog(self, path: str) -> bool:
@@ -675,10 +683,22 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.bottom_paned.set_vexpand(True)
         self.bottom_paned.set_hexpand(True)
 
-        # 1. Linke Seite: Eingebettetes VTE-Terminal
-        self.terminal_widget = EmbeddedTerminal()
-        term_frame = Gtk.Frame(label="Echtes Terminal")
-        term_frame.set_child(self.terminal_widget)
+        # 1. DAR und LTFS erhalten VERSCHIEDENE VTE-Terminals / Shells / PTYs.
+        # Die beiden Tabs wechseln nur die Anzeige und lassen beide Prozesse laufen.
+        self.terminal_tabs = Gtk.Notebook()
+        self.terminal_tabs.set_hexpand(True)
+        self.terminal_tabs.set_vexpand(True)
+        self.terminal_tabs.set_scrollable(True)
+
+        self.terminal_widget = EmbeddedTerminal()  # bestehender DAR-Kanal
+        self.terminal_tabs.append_page(self.terminal_widget, Gtk.Label(label="DAR-Terminal"))
+
+        self.ltfs_terminal_widget = EmbeddedTerminal()  # vollständig getrennte PTY
+        ltfs_panel = self._build_ltfs_panel()
+        self.terminal_tabs.append_page(ltfs_panel, Gtk.Label(label="LTFS-Terminal"))
+
+        term_frame = Gtk.Frame(label="Interaktive Terminals (DAR / LTFS)")
+        term_frame.set_child(self.terminal_tabs)
         self.term_frame = term_frame
         term_frame.set_vexpand(True)
         term_frame.set_hexpand(True)
@@ -711,6 +731,229 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
 
         self.set_child(main)
         self._install_css()
+
+    def _build_ltfs_panel(self):
+        """Eigene LTFS-Bedienung über ein unabhängiges interaktives Terminal."""
+        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        panel.set_margin_top(6)
+        panel.set_margin_start(6)
+        panel.set_margin_end(6)
+        panel.set_margin_bottom(6)
+
+        config = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        panel.append(config)
+
+        device_label = Gtk.Label(label="Bandlaufwerk:")
+        config.append(device_label)
+        self.ltfs_device_entry = Gtk.Entry()
+        self.ltfs_device_entry.set_placeholder_text("z. B. /dev/sg3")
+        self.ltfs_device_entry.set_text(os.environ.get("DAR_EXPLORER_LTFS_DEVICE", ""))
+        self.ltfs_device_entry.set_width_chars(17)
+        self.ltfs_device_entry.set_hexpand(True)
+        config.append(self.ltfs_device_entry)
+
+        mount_label = Gtk.Label(label="Mountpoint:")
+        config.append(mount_label)
+        self.ltfs_mount_entry = Gtk.Entry()
+        self.ltfs_mount_entry.set_text(os.environ.get("DAR_EXPLORER_LTFS_MOUNTPOINT", "/mnt/ltfs"))
+        self.ltfs_mount_entry.set_width_chars(24)
+        self.ltfs_mount_entry.set_hexpand(True)
+        self.ltfs_mount_entry.connect("changed", lambda *_: self._refresh_ltfs_mount_state())
+        config.append(self.ltfs_mount_entry)
+
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        panel.append(actions)
+        self.ltfs_mount_button = Gtk.Button(label="Band mounten")
+        self.ltfs_mount_button.connect("clicked", self._on_ltfs_mount_clicked)
+        actions.append(self.ltfs_mount_button)
+        self.ltfs_unmount_button = Gtk.Button(label="Band aushängen")
+        self.ltfs_unmount_button.connect("clicked", self._on_ltfs_unmount_clicked)
+        actions.append(self.ltfs_unmount_button)
+        refresh = Gtk.Button(label="Status / Freigabe")
+        refresh.connect("clicked", self._on_ltfs_status_clicked)
+        actions.append(refresh)
+
+        self.ltfs_status_label = Gtk.Label(label="LTFS-Status wird geprüft …")
+        self.ltfs_status_label.set_xalign(0)
+        self.ltfs_status_label.set_hexpand(True)
+        self.ltfs_status_label.set_ellipsize(Pango.EllipsizeMode.END)
+        actions.append(self.ltfs_status_label)
+
+        explanation = Gtk.Label(
+            label="Bandwechsel nur, wenn DAR auf das nächste Slice wartet. "
+                  "Nach dem Aushängen vollständigen LTFS-Abschluss abwarten."
+        )
+        explanation.set_wrap(True)
+        explanation.set_xalign(0)
+        explanation.add_css_class("dim-label")
+        panel.append(explanation)
+
+        self.ltfs_terminal_widget.set_vexpand(True)
+        panel.append(self.ltfs_terminal_widget)
+        self._refresh_ltfs_mount_state()
+        return panel
+
+    def _refresh_ltfs_mount_state(self):
+        """Mount-Zustand nur über /proc/self/mountinfo, niemals per Tape-Zugriff."""
+        if not hasattr(self, "ltfs_mount_entry") or not hasattr(self, "ltfs_status_label"):
+            return True
+        mountpoint = self.ltfs_mount_entry.get_text().strip()
+        if not mountpoint or not os.path.isabs(os.path.expanduser(mountpoint)):
+            self.ltfs_status_label.set_text("Absoluten Mountpoint angeben")
+            self.ltfs_mount_button.set_sensitive(False)
+            self.ltfs_unmount_button.set_sensitive(False)
+            return True
+        fs_type = filesystem_at(mountpoint)
+        if fs_type is None:
+            self._ltfs_unmount_pending = False
+            if self._ltfs_mount_pending:
+                message = "LTFS-Mount angefordert – Terminal prüfen"
+            elif self._ltfs_unmount_requested:
+                message = "Nicht gemountet – LTFS-Abschluss im Terminal prüfen!"
+            else:
+                message = "Nicht gemountet"
+            self.ltfs_status_label.set_text(message)
+            self.ltfs_mount_button.set_sensitive(
+                not self._ltfs_mount_pending and not self._ltfs_unmount_requested
+            )
+            self.ltfs_unmount_button.set_sensitive(False)
+        elif is_ltfs_filesystem(fs_type):
+            self._ltfs_mount_pending = False
+            message = ("LTFS-Unmount angefordert – Terminal prüfen" if self._ltfs_unmount_pending
+                       else f"LTFS gemountet ({fs_type})")
+            self.ltfs_status_label.set_text(message)
+            self.ltfs_mount_button.set_sensitive(False)
+            self.ltfs_unmount_button.set_sensitive(not self._ltfs_unmount_pending)
+        else:
+            self.ltfs_status_label.set_text(f"Fremdes Dateisystem: {fs_type} – nicht aushängen")
+            self.ltfs_mount_button.set_sensitive(False)
+            self.ltfs_unmount_button.set_sensitive(False)
+        return True
+
+    def _on_ltfs_status_clicked(self, _button):
+        """Status prüfen; Freigabe nach dem Unmount nur ausdrücklich bestätigen."""
+        mountpoint = self.ltfs_mount_entry.get_text().strip()
+        fs_type = filesystem_at(mountpoint) if mountpoint else None
+        if self._ltfs_unmount_requested and fs_type is None:
+            title = "Ist LTFS vollständig beendet?"
+            detail = (
+                "Die Mount-Tabelle enthält das LTFS-Dateisystem nicht mehr. "
+                "Das allein beweist noch nicht, dass LTFS seinen Index "
+                "vollständig geschrieben und das Laufwerk freigegeben hat. "
+                "Bitte erst im LTFS-Terminal prüfen und danach freigeben."
+            )
+            reset = "Abschluss bestätigt"
+            def release():
+                self._ltfs_unmount_requested = False
+                self._ltfs_unmount_pending = False
+        elif self._ltfs_mount_pending and fs_type is None:
+            title = "Fehlgeschlagenen Mount zurücksetzen?"
+            detail = (
+                "Bitte zuerst im LTFS-Terminal prüfen, ob der Mount "
+                "wirklich fehlgeschlagen bzw. beendet ist. Ein noch laufender "
+                "Mount darf nicht ein zweites Mal gestartet werden."
+            )
+            reset = "Fehlversuch zurücksetzen"
+            def release():
+                self._ltfs_mount_pending = False
+        elif self._ltfs_unmount_pending and is_ltfs_filesystem(fs_type):
+            title = "Fehlgeschlagenen Unmount zurücksetzen?"
+            detail = (
+                "Bitte im LTFS-Terminal prüfen, ob der Unmount wirklich "
+                "fehlgeschlagen ist. Den Unmount nicht gleichzeitig mehrfach starten."
+            )
+            reset = "Fehlversuch zurücksetzen"
+            def release():
+                self._ltfs_unmount_pending = False
+                self._ltfs_unmount_requested = False
+        else:
+            self._refresh_ltfs_mount_state()
+            return
+
+        dialog = Gtk.MessageDialog(
+            transient_for=self, modal=True,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.NONE, text=title, secondary_text=detail,
+        )
+        dialog.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
+        dialog.add_button(reset, Gtk.ResponseType.OK)
+        def on_response(dlg, response_id):
+            dlg.destroy()
+            if response_id == Gtk.ResponseType.OK:
+                release()
+            self._refresh_ltfs_mount_state()
+        dialog.connect("response", on_response)
+        dialog.present()
+
+    def _ltfs_send_command(self, command: str):
+        """Exklusiv in LTFS-PTY schreiben, nicht ins DAR-Terminal."""
+        self.ltfs_terminal_widget.terminal.feed_child((command + "\n").encode("utf-8"))
+        self.terminal_tabs.set_current_page(1)
+        self._force_show_log()
+
+    def _on_ltfs_mount_clicked(self, _button):
+        from ltfs_backend.operations import ltfs_executable
+        try:
+            mountpoint = validate_mountpoint(self.ltfs_mount_entry.get_text())
+            if filesystem_at(mountpoint):
+                raise ValueError("Der Mountpoint ist bereits belegt.")
+            if not os.path.isdir(mountpoint):
+                raise ValueError(f"Mountpoint existiert nicht als Verzeichnis: {mountpoint}")
+            if self._ltfs_mount_pending:
+                raise ValueError("Ein LTFS-Mount wurde bereits gestartet. Bitte das Terminal prüfen.")
+            # LTFS wird im Hintergrund der LTFS-Shell gestartet: sie bleibt
+            # für den späteren Unmount bedienbar, selbst wenn LTFS nicht daemonisiert.
+            command = build_mount_command(
+                self.ltfs_device_entry.get_text(), mountpoint, executable=ltfs_executable()
+            )
+            shell_line = shlex.join(command) + " &"
+            self._ltfs_unmount_requested = False
+            self._ltfs_mount_pending = True
+            self._ltfs_send_command(shell_line)
+            self._refresh_ltfs_mount_state()
+            self.ltfs_status_label.set_text("LTFS-Mount gestartet – Terminalausgabe beachten")
+        except (ValueError, FileNotFoundError) as exc:
+            self._show_error("LTFS-Mount nicht gestartet", str(exc))
+
+    def _on_ltfs_unmount_clicked(self, _button):
+        try:
+            mountpoint = validate_mountpoint(self.ltfs_mount_entry.get_text())
+            fs_type = filesystem_at(mountpoint)
+            if not is_ltfs_filesystem(fs_type):
+                raise ValueError("Der angegebene Pfad ist nicht als LTFS gemountet.")
+            command = build_unmount_command(mountpoint)
+        except (ValueError, FileNotFoundError) as exc:
+            self._show_error("LTFS-Unmount nicht gestartet", str(exc))
+            return
+
+        # Kein automatisches Unmount während eines DAR-Schreibvorgangs.
+        # Der Zustand des DAR-Medienprompts lässt sich aus dem PTY nicht
+        # zuverlässig auslesen; deshalb explizite Bestätigung durch den Nutzer.
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.NONE,
+            text="LTFS-Band wirklich aushängen?",
+            secondary_text=(
+                "Nur fortfahren, wenn DAR das aktuelle Slice abgeschlossen hat "
+                "und auf den Bandwechsel wartet. Ein laufender Schreibvorgang "
+                "darf nicht unterbrochen werden. Vor dem Bandwechsel muss "
+                "LTFS vollständig beendet sein."
+            ),
+        )
+        dialog.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Aushängen", Gtk.ResponseType.OK)
+        def on_response(dlg, response_id):
+            dlg.destroy()
+            if response_id == Gtk.ResponseType.OK:
+                self._ltfs_unmount_requested = True
+                self._ltfs_unmount_pending = True
+                self._ltfs_send_command(shlex.join(command))
+                self._refresh_ltfs_mount_state()
+                self.ltfs_status_label.set_text("Unmount gestartet – Abschluss im Terminal prüfen")
+        dialog.connect("response", on_response)
+        dialog.present()
 
     def _install_css(self):
         css = Gtk.CssProvider()
@@ -1587,6 +1830,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         cwd = str(Path(options.source).expanduser().resolve())
         shell_line = f"cd -- {shlex.quote(cwd)} && {command}"
         self.terminal_widget.terminal.feed_child((shell_line + "\n").encode("utf-8"))
+        self.terminal_tabs.set_current_page(0)
         self.status_label.set_text("DAR läuft interaktiv im Terminal …")
         self._force_show_log()
 
