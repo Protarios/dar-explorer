@@ -559,13 +559,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.filter_dropdown.set_tooltip_text("Dateityp filtern")
         self.filter_dropdown.connect("notify::selected", lambda *_: self._on_view_filter_changed())
 
-        self.sort_dropdown = Gtk.DropDown.new_from_strings([
-            "Name ↑", "Name ↓", "Größe ↑", "Größe ↓", "Datum ↑", "Datum ↓"
-        ])
-        self.sort_dropdown.set_tooltip_text("Sortierung")
-        self.sort_dropdown.connect("notify::selected", lambda *_: self._on_sort_changed())
-
-        header.pack_end(self.sort_dropdown)
         header.pack_end(self.filter_dropdown)
         header.pack_end(self.search)
 
@@ -643,11 +636,12 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.column_view.set_show_row_separators(True)
         self.column_view.set_show_column_separators(True)
 
-        self._add_column("Name", self._name_factory(), 330)
-        self._add_column("Typ", self._type_factory(), 125)
-        self._add_column("Größe", self._size_factory(), 110)
-        self._add_column("Datum", self._date_factory(), 190)
-        self._add_column("Pfad", self._path_factory(), 500)
+        self._add_column("Name", self._name_factory(), 330, "name")
+        self._add_column("Typ", self._type_factory(), 125, "type")
+        self._add_column("Größe", self._size_factory(), 110, "size")
+        self._add_column("Datum", self._date_factory(), 190, "date")
+        self._add_column("Pfad", self._path_factory(), 500, "path")
+        self.column_view.sort_by_column(self.column_view.get_columns().get_item(0), Gtk.SortType.ASCENDING)
         self.column_view.connect("activate", self.on_right_activate)
         right_click = Gtk.GestureClick(button=3)
         right_click.connect("pressed", self._on_right_context_pressed)
@@ -734,11 +728,29 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
 
-    def _add_column(self, title, factory, width):
+    def _add_column(self, title, factory, width, sort_key):
         col = Gtk.ColumnViewColumn(title=title, factory=factory)
         col.set_resizable(True)
         col.set_fixed_width(width)
+        # GTK ColumnView manages the clickable header and the sort arrow.
+        col.set_sorter(Gtk.CustomSorter.new(
+            lambda a, b, *_: self._compare_column(a, b, sort_key)
+        ))
         self.column_view.append_column(col)
+
+    @staticmethod
+    def _compare_column(a, b, key):
+        if key == "size":
+            av, bv = a.size_bytes, b.size_bytes
+        elif key == "date":
+            av, bv = a.timestamp, b.timestamp
+        elif key == "type":
+            av, bv = a.type_text.casefold(), b.type_text.casefold()
+        elif key == "path":
+            av, bv = a.path.casefold(), b.path.casefold()
+        else:
+            av, bv = a.name.casefold(), b.name.casefold()
+        return -1 if av < bv else (1 if av > bv else 0)
 
     @staticmethod
     def _label_factory():
@@ -1297,19 +1309,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         filt = Gtk.CustomFilter.new(lambda item: visible(item))
         filtered = Gtk.FilterListModel.new(store, filt)
 
-        def compare(a, b, *_user_data):
-            key = self._sort_key
-            if key == "size":
-                av, bv = a.size_bytes, b.size_bytes
-            elif key == "date":
-                av, bv = a.timestamp, b.timestamp
-            else:
-                av, bv = a.name.casefold(), b.name.casefold()
-            result = -1 if av < bv else (1 if av > bv else 0)
-            return -result if self._sort_reverse else result
-
-        sorter = Gtk.CustomSorter.new(compare)
-        sorted_model = Gtk.SortListModel.new(filtered, sorter)
+        sorted_model = Gtk.SortListModel.new(filtered, self.column_view.get_sorter())
         self.right_selection.set_model(sorted_model)
         self.status_label.set_text(f"{sorted_model.get_n_items():,} Einträge".replace(",", "."))
         self._update_extract_button()
@@ -1317,12 +1317,6 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
     def _on_view_filter_changed(self):
         selected = self.filter_dropdown.get_selected()
         self._type_filter = ["all", "files", "dirs"][selected if selected < 3 else 0]
-        self._set_right_nodes(self._current_nodes)
-
-    def _on_sort_changed(self):
-        selected = self.sort_dropdown.get_selected()
-        self._sort_key = "name" if selected < 2 else ("size" if selected < 4 else "date")
-        self._sort_reverse = selected in (1, 3, 5)
         self._set_right_nodes(self._current_nodes)
 
     def on_search_changed(self, _entry):
