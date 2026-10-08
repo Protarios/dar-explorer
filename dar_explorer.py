@@ -28,7 +28,7 @@ from dar_backend.operations import (
     command_compare, command_isolate, command_repair, command_test, command_xform,
     shell_command,
 )
-from dialogs.phase2_tools import Phase2OperationDialog
+from dialogs.phase2_tools import Phase2OperationDialog, RepairDialog
 from dar_backend.archive import ArchiveCreateOptions
 from dialogs.archive_create import ArchiveCreateDialog
 
@@ -486,12 +486,16 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             self._show_archive_metadata(); return
         if operation == "index":
             self._start_background_index(); return
-        dialog = Phase2OperationDialog(self, operation, self.current_archive, self._run_phase2_operation)
+        if operation == "repair":
+            # Repair ist absichtlich unabhängig vom aktuell geöffneten Archiv.
+            dialog = RepairDialog(self, self._run_phase2_operation)
+        else:
+            dialog = Phase2OperationDialog(self, operation, self.current_archive, self._run_phase2_operation)
         dialog.present()
 
     def _run_phase2_operation(self, operation, data):
         archive = data.get("archive", "")
-        if operation in {"repair", "xform", "isolate"} and self.is_current_catalog:
+        if operation in {"xform", "isolate"} and self.is_current_catalog:
             self._show_error("Nicht auf isoliertem Katalog", "Für diese Operation muss ein echtes DAR-Archiv geöffnet sein.")
             return
 

@@ -11,6 +11,148 @@ from .archive_create import SizeSelector
 
 
 
+class RepairDialog(Gtk.Window):
+    """Eigenständiger Dialog für die manuelle Reparatur eines defekten Archivs."""
+
+    def __init__(self, parent, on_run):
+        super().__init__(
+            title="Unterbrochenes Archiv reparieren",
+            transient_for=parent,
+            modal=True,
+        )
+        self.on_run = on_run
+        self.set_default_size(680, -1)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(16)
+        box.set_margin_bottom(16)
+        box.set_margin_start(16)
+        box.set_margin_end(16)
+        self.set_child(box)
+
+        info = Gtk.Label()
+        info.set_wrap(True)
+        info.set_xalign(0)
+        info.set_text(
+            "Die Reparatur wird unabhängig vom aktuell geöffneten Archiv gestartet. "
+            "Wähle einen vorhandenen Slice des defekten oder unvollständigen Archivs. "
+            "DAR verwendet daraus die Archivbasis und erzeugt ein neues repariertes Archiv. "
+            "Das vorhandene Archiv wird nicht verändert. Die Diagnose und das Ergebnis von "
+            "DAR werden im eingebetteten Terminal angezeigt."
+        )
+        box.append(info)
+
+        box.append(Gtk.Label(label="Beschädigten Archiv-Slice:", xalign=0))
+        source_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        source_row.set_hexpand(True)
+        self.source_entry = Gtk.Entry()
+        self.source_entry.set_hexpand(True)
+        self.source_entry.set_placeholder_text("z. B. /backup/archiv.3.dar")
+        source_row.append(self.source_entry)
+        source_button = Gtk.Button(label="Slice auswählen …")
+        source_button.connect("clicked", self._choose_source)
+        source_row.append(source_button)
+        box.append(source_row)
+
+        box.append(Gtk.Label(label="Zielarchiv:", xalign=0))
+        destination_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        destination_row.set_hexpand(True)
+        self.destination_entry = Gtk.Entry()
+        self.destination_entry.set_hexpand(True)
+        self.destination_entry.set_placeholder_text("Neuer Name für das reparierte Archiv")
+        destination_row.append(self.destination_entry)
+        destination_button = Gtk.Button(label="Zielarchiv wählen …")
+        destination_button.connect("clicked", self._choose_destination)
+        destination_row.append(destination_button)
+        box.append(destination_row)
+
+        box.append(Gtk.Label(label="Passwort (optional):", xalign=0))
+        self.password_entry = Gtk.Entry()
+        self.password_entry.set_visibility(False)
+        self.password_entry.set_placeholder_text("Leer lassen, wenn DAR interaktiv fragen soll")
+        self.password_entry.set_hexpand(True)
+        box.append(self.password_entry)
+
+        box.append(Gtk.Label(label="Slice-Größe des reparierten Archivs (optional):", xalign=0))
+        self.slice_size = SizeSelector()
+        self.slice_size.set_size("")
+        box.append(self.slice_size)
+
+        box.append(Gtk.Label(label="Größe des ersten Slices (optional):", xalign=0))
+        self.first_slice_size = SizeSelector()
+        self.first_slice_size.set_size("")
+        box.append(self.first_slice_size)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        buttons.set_halign(Gtk.Align.END)
+        box.append(buttons)
+        cancel = Gtk.Button(label="Abbrechen")
+        run = Gtk.Button(label="Reparatur starten")
+        run.add_css_class("suggested-action")
+        buttons.append(cancel)
+        buttons.append(run)
+        cancel.connect("clicked", lambda *_: self.close())
+        run.connect("clicked", self._run_clicked)
+
+    def _choose_source(self, _button):
+        dialog = Gtk.FileDialog(title="Vorhandenen Slice des defekten Archivs auswählen")
+        dialog.open(self, None, self._finish_source)
+
+    def _finish_source(self, dialog, result):
+        try:
+            file = dialog.open_finish(result)
+            if not file or not file.get_path():
+                return
+            source = Path(file.get_path())
+            self.source_entry.set_text(str(source))
+            # Nur einen sinnvollen Vorschlag erzeugen; der Benutzer kann ihn danach ändern.
+            name = source.name
+            import re
+            base = re.sub(r"\.\d+\.dar$", "", name)
+            base = re.sub(r"\.dar$", "", base)
+            self.destination_entry.set_text(str(source.parent / f"{base}_repaired"))
+        except Exception:
+            pass
+
+    def _choose_destination(self, _button):
+        dialog = Gtk.FileDialog(title="Zielarchiv für die Reparatur wählen")
+        dialog.save(self, None, self._finish_destination)
+
+    def _finish_destination(self, dialog, result):
+        try:
+            file = dialog.save_finish(result)
+            if file and file.get_path():
+                self.destination_entry.set_text(file.get_path())
+        except Exception:
+            pass
+
+    def _run_clicked(self, _button):
+        try:
+            source = self.source_entry.get_text().strip()
+            destination = self.destination_entry.get_text().strip()
+            if not source:
+                raise ValueError("Bitte einen vorhandenen Slice des defekten Archivs auswählen.")
+            if not destination:
+                raise ValueError("Bitte ein Zielarchiv auswählen.")
+            if Path(source).resolve() == Path(destination).resolve():
+                raise ValueError("Quell-Slice und Zielarchiv dürfen nicht identisch sein.")
+
+            slice_text = self.slice_size.get_bytes_text()
+            first_text = self.first_slice_size.get_bytes_text()
+            data = {
+                "archive": source,
+                "destination": destination,
+                "password": self.password_entry.get_text() or None,
+                "slice_size": int(slice_text) if slice_text else None,
+                "first_slice_size": int(first_text) if first_text else None,
+            }
+            self.on_run("repair", data)
+            self.close()
+        except Exception as exc:
+            err = Gtk.AlertDialog(message=str(exc))
+            err.show(self)
+
+
 class Phase2OperationDialog(Gtk.Window):
     """Kleiner, wiederverwendbarer Dialog für Phase-2-DAR-Operationen."""
 
