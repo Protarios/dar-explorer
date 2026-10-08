@@ -1297,7 +1297,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         filt = Gtk.CustomFilter.new(lambda item: visible(item))
         filtered = Gtk.FilterListModel.new(store, filt)
 
-        def compare(a, b):
+        def compare(a, b, *_user_data):
             key = self._sort_key
             if key == "size":
                 av, bv = a.size_bytes, b.size_bytes
