@@ -34,7 +34,8 @@ from dialogs.archive_create import ArchiveCreateDialog
 from ltfs_backend.operations import (
     build_mount_command, build_unmount_command, filesystem_at, is_ltfs_filesystem,
     validate_mountpoint, build_device_list_command, build_tape_status_command,
-    build_tape_eject_command,
+    build_tape_eject_command, build_format_command, any_ltfs_mounted,
+    validate_cartridge_label,
 )
 from config_manager import load_config, save_config
 
@@ -277,6 +278,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self._ltfs_unmount_requested = False
         self._ltfs_unmount_confirmed = False
         self._ltfs_eject_pending = False
+        self._ltfs_format_pending = False
         self._ltfs_config = load_config()
         self._build_ui()
         GLib.timeout_add_seconds(2, self._refresh_ltfs_mount_state)
@@ -827,6 +829,30 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.ltfs_status_label.set_ellipsize(Pango.EllipsizeMode.END)
         actions.append(self.ltfs_status_label)
 
+        # Destruktiver Wartungsschritt bewusst nicht in die reguläre
+        # Bandwechsel-Buttonleiste integrieren.
+        preparation = Gtk.Expander(label="Neues Band vorbereiten / LTFS-Formatierung (Datenverlust!)")
+        preparation.set_expanded(False)
+        prep_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        prep_box.set_margin_top(5)
+        prep_note = Gtk.Label(
+            label="Nur für nachweislich freigegebene, nicht benötigte Bänder. "
+                  "Unbekannt bedeutet nicht leer! Zuerst Etikett, Laufwerk und "
+                  "vorhandene Daten außerhalb dieses Dialogs prüfen. "
+                  "Ein späterer Medienkatalog ist noch NICHT angebunden."
+        )
+        prep_note.set_wrap(True)
+        prep_note.set_xalign(0)
+        prep_box.append(prep_note)
+        prep_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.ltfs_format_button = Gtk.Button(label="Formatierung prüfen …")
+        self.ltfs_format_button.add_css_class("destructive-action")
+        self.ltfs_format_button.connect("clicked", self._on_ltfs_format_clicked)
+        prep_controls.append(self.ltfs_format_button)
+        prep_box.append(prep_controls)
+        preparation.set_child(prep_box)
+        panel.append(preparation)
+
         explanation = Gtk.Label(
             label="Manueller Bandwechsel: DAR muss auf das nächste Slice warten → "
                   "LTFS aushängen → Terminal-Abschluss prüfen und bestätigen → "
@@ -913,6 +939,113 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         dialog.connect("response", on_response)
         dialog.present()
 
+    def _on_ltfs_format_clicked(self, _button):
+        """Manuell freigegebene LTFS-Neuformatierung, ohne Force-Optionen."""
+        try:
+            mountpoint = validate_mountpoint(self.ltfs_mount_entry.get_text())
+            if filesystem_at(mountpoint) is not None or any_ltfs_mounted():
+                raise ValueError("Mindestens ein LTFS-Dateisystem ist noch gemountet; Formatierung gesperrt.")
+            if (self._ltfs_mount_pending or self._ltfs_unmount_requested
+                    or self._ltfs_eject_pending or self._ltfs_format_pending):
+                raise ValueError("Eine LTFS-Operation ist noch nicht abgeschlossen.")
+            device = self.ltfs_device_entry.get_text().strip()
+            # Prüfung des Zielgeräts erfolgt auch beim Kommandobau.
+            command = build_format_command(device)
+        except (ValueError, FileNotFoundError, RuntimeError) as exc:
+            self._show_error("Formatierung gesperrt", str(exc))
+            return
+
+        dlg = Gtk.Dialog(title="LTFS-Band formatieren – Datenverlust möglich",
+                         transient_for=self, modal=True)
+        dlg.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
+        proceed = dlg.add_button("Formatieren", Gtk.ResponseType.OK)
+        proceed.add_css_class("destructive-action")
+        area = dlg.get_content_area()
+        area.set_spacing(10)
+        area.set_margin_top(15)
+        area.set_margin_bottom(15)
+        area.set_margin_start(18)
+        area.set_margin_end(18)
+        warning = Gtk.Label(
+            label=f"ZIELLAUFWERK: {device}\n\n"
+                  "mkltfs kann sämtliche vorhandenen Daten auf dem eingelegten "
+                  "Band unzugänglich machen. Eine unbekannte Kassette ist NICHT "
+                  "automatisch leer. Der zukünftige Medienkatalog schützt hier "
+                  "noch nicht. Kein --force; ältere oder fremde Formate können "
+                  "trotzdem überschrieben werden."
+        )
+        warning.set_wrap(True)
+        warning.set_xalign(0)
+        area.append(warning)
+        area.append(Gtk.Label(label="Physische Bandkennung (Etikett selbst kontrollieren):", xalign=0))
+        label_entry = Gtk.Entry()
+        label_entry.set_placeholder_text("z. B. ABC123")
+        area.append(label_entry)
+        area.append(Gtk.Label(label="LTFS-Volumename (optional, nicht die Bandkennung):", xalign=0))
+        volume_entry = Gtk.Entry()
+        area.append(volume_entry)
+        verified_drive = Gtk.CheckButton(label="Laufwerk und eingelegtes Band physisch überprüft")
+        verified_empty = Gtk.CheckButton(
+            label="Band ist ausdrücklich zur Neuformatierung freigegeben; "
+                  "es enthält keine noch benötigten Daten"
+        )
+        area.append(verified_drive)
+        area.append(verified_empty)
+        dar_safe = Gtk.CheckButton(
+            label="DAR schreibt aktuell nicht auf das Band (ggf. wartet DAR auf Medienwechsel)"
+        )
+        area.append(dar_safe)
+        area.append(Gtk.Label(label="Zur Bestätigung exakt FORMATIEREN ABC123 eingeben (mit eigener Bandkennung):", xalign=0))
+        confirmation_entry = Gtk.Entry()
+        area.append(confirmation_entry)
+        error_label = Gtk.Label(xalign=0)
+        error_label.set_wrap(True)
+        error_label.add_css_class("error")
+        area.append(error_label)
+
+        def on_response(dialog, response_id):
+            if response_id != Gtk.ResponseType.OK:
+                dialog.destroy()
+                return
+            try:
+                label = validate_cartridge_label(label_entry.get_text())
+                if not (verified_drive.get_active() and verified_empty.get_active()
+                        and dar_safe.get_active()):
+                    raise ValueError("Alle drei Sicherheitsbestätigungen sind erforderlich.")
+                if confirmation_entry.get_text() != f"FORMATIEREN {label}":
+                    raise ValueError("Die eingegebene Bestätigung stimmt nicht exakt mit der Bandkennung überein.")
+                # Vor dem tatsächlichen Start erneut prüfen: Zustand kann
+                # während des offenen Dialogs verändert worden sein.
+                if filesystem_at(mountpoint) is not None or any_ltfs_mounted():
+                    raise ValueError("Ein Dateisystem wurde gemountet – Vorgang abgebrochen.")
+                if (self._ltfs_mount_pending or self._ltfs_unmount_requested
+                        or self._ltfs_eject_pending or self._ltfs_format_pending):
+                    raise ValueError("LTFS-Status inzwischen geändert – Vorgang abgebrochen.")
+                if device != self.ltfs_device_entry.get_text().strip():
+                    raise ValueError("Zielgerät hat sich geändert – Vorgang abgebrochen.")
+                argv = build_format_command(device, volume_name=volume_entry.get_text())
+            except (ValueError, FileNotFoundError, RuntimeError) as exc:
+                error_label.set_text(str(exc))
+                return
+
+            dialog.destroy()
+            self._ltfs_unmount_confirmed = False
+            self._ltfs_format_pending = True
+            # Ergebnis wird ausdrücklich im LTFS-Terminal angezeigt, aber
+            # die Freigabe bleibt bis zur manuellen Bestätigung gesperrt.
+            shell = shlex.join(argv) + (
+                '; __dar_ltfs_format_rc=$?; printf "\\n[DAR Explorer] mkltfs Exit-Code: %s\\n" '
+                '"$__dar_ltfs_format_rc"'
+            )
+            self._ltfs_send_command(shell)
+            self._refresh_ltfs_mount_state()
+            self.ltfs_status_label.set_text(
+                f"Formatierung von {label} gestartet – Terminal prüfen; Abschluss bestätigen"
+            )
+
+        dlg.connect("response", on_response)
+        dlg.present()
+
     def _refresh_ltfs_mount_state(self):
         """Regelmäßige Mount-Erkennung nur über Mountinfo; kein Zugriff aufs Tape."""
         if not hasattr(self, "ltfs_mount_entry") or not hasattr(self, "ltfs_status_label"):
@@ -923,11 +1056,14 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             self.ltfs_mount_button.set_sensitive(False)
             self.ltfs_unmount_button.set_sensitive(False)
             self.ltfs_eject_button.set_sensitive(False)
+            self.ltfs_format_button.set_sensitive(False)
             return True
         fs_type = filesystem_at(mountpoint)
         if fs_type is None:
             self._ltfs_unmount_pending = False
-            if self._ltfs_mount_pending:
+            if self._ltfs_format_pending:
+                message = "mkltfs gestartet – Terminalabschluss kontrollieren und bestätigen!"
+            elif self._ltfs_mount_pending:
                 message = "LTFS-Mount angefordert – Terminal prüfen"
             elif self._ltfs_unmount_requested:
                 message = "Ausgehängt – LTFS-Prozessabschluss prüfen und bestätigen!"
@@ -947,13 +1083,14 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             message = f"Fremdes Dateisystem: {fs_type} – nicht aushängen"
         self.ltfs_status_label.set_text(message)
         pending = (self._ltfs_mount_pending or self._ltfs_unmount_requested
-                   or self._ltfs_eject_pending)
+                   or self._ltfs_eject_pending or self._ltfs_format_pending)
         busy = fs_type is not None or pending
         for entry in (self.ltfs_device_entry, self.ltfs_mount_entry):
             entry.set_sensitive(not busy)
         self.ltfs_mount_button.set_sensitive(fs_type is None and not pending)
         self.ltfs_unmount_button.set_sensitive(
-            is_ltfs_filesystem(fs_type) and not self._ltfs_unmount_pending)
+            is_ltfs_filesystem(fs_type) and not self._ltfs_unmount_pending
+            and not self._ltfs_format_pending)
         self.ltfs_mkdir_button.set_sensitive(not busy)
         self.ltfs_list_button.set_sensitive(not busy)
         # mt darf während LTFS-Mount/-Unmount nicht ans Laufwerk.
@@ -961,13 +1098,30 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.ltfs_tape_status_button.set_sensitive(not busy)
         self.ltfs_eject_button.set_sensitive(
             fs_type is None and not pending and self._ltfs_unmount_confirmed)
+        # Andere LTFS-Mounts können an fremden Mountpoints liegen.
+        try:
+            format_possible = not any_ltfs_mounted()
+        except RuntimeError:
+            format_possible = False
+        self.ltfs_format_button.set_sensitive(fs_type is None and not pending and format_possible)
         return True
 
     def _on_ltfs_status_clicked(self, _button):
         """Status prüfen; Freigabe nach dem Unmount nur ausdrücklich bestätigen."""
         mountpoint = self.ltfs_mount_entry.get_text().strip()
         fs_type = filesystem_at(mountpoint) if mountpoint else None
-        if self._ltfs_eject_pending and fs_type is None:
+        if self._ltfs_format_pending and fs_type is None:
+            title = "Ist mkltfs vollständig beendet?"
+            detail = (
+                "Erst im LTFS-Terminal den Exit-Code von mkltfs überprüfen. "
+                "0 bedeutet Erfolg, andere Werte bedeuten Fehlschlag. "
+                "Diese Freigabe markiert das Band NICHT automatisch als formatiert "
+                "und führt keinen Mount aus. Nur nach beendetem Befehl freigeben."
+            )
+            reset = "Abschluss geprüft / freigeben"
+            def release():
+                self._ltfs_format_pending = False
+        elif self._ltfs_eject_pending and fs_type is None:
             title = "Ist das Band vollständig ausgeworfen?"
             detail = ("Im LTFS-Terminal kontrollieren, ob mt offline beendet ist "
                       "und das Band physisch entladen wurde. Erst dann "
@@ -2474,7 +2628,8 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             mountpoint = self.ltfs_mount_entry.get_text().strip()
             mounted = filesystem_at(mountpoint) if mountpoint else None
             if (mounted is not None or self._ltfs_mount_pending
-                    or self._ltfs_unmount_requested or self._ltfs_eject_pending):
+                    or self._ltfs_unmount_requested or self._ltfs_eject_pending
+                    or self._ltfs_format_pending):
                 self._show_error(
                     "LTFS ist noch aktiv",
                     "Vor dem Schließen LTFS im eigenen Terminal sauber aushängen und "

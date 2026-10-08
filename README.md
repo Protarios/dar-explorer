@@ -1018,7 +1018,7 @@ Die Terminals laufen parallel. Ein Wechsel des Reiters unterbricht die gerade la
 
 ## Einrichtung
 
-LTFS muss separat installiert und für das Bandlaufwerk eingerichtet sein. Die Anwendung überprüft vor dem Mounten, ob der Befehl `ltfs` verfügbar ist. Das eingetragene **Bandlaufwerk** ist beispielsweise `/dev/sg3` (je nach LTFS-Version auch Laufwerksseriennummer); den korrekten Gerätenamen muss man am eigenen System ermitteln. Das Mount-Verzeichnis, beispielsweise `/mnt/ltfs`, muss bereits existieren. Das Programm führt **keine** automatische Formatierung durch und nutzt **kein** `sudo`.
+LTFS muss separat installiert und für das Bandlaufwerk eingerichtet sein. Die Anwendung überprüft vor dem Mounten, ob der Befehl `ltfs` verfügbar ist. Das eingetragene **Bandlaufwerk** ist beispielsweise `/dev/sg3` (je nach LTFS-Version auch Laufwerksseriennummer); den korrekten Gerätenamen muss man am eigenen System ermitteln. Das Mount-Verzeichnis, beispielsweise `/mnt/ltfs`, muss bereits existieren. Es gibt keine automatische Formatierung: Die **manuelle** `mkltfs`-Formatierung befindet sich in einem gesonderten Sicherheitsdialog (siehe unten). Das Programm nutzt **kein** `sudo`.
 
 Optional lassen sich Vorgabewerte beim Programmstart über Umgebungsvariablen setzen:
 
@@ -1037,7 +1037,7 @@ export DAR_EXPLORER_LTFS_MOUNTPOINT=/mnt/ltfs
 5. Nach vollständigem LTFS-Abschluss über **Status / Freigabe** explizit bestätigen, dass LTFS beendet ist. Erst dann das Band physisch wechseln, ein neues Band einlegen, **Band mounten** wählen und den erfolgreichen Mount prüfen.
 6. Erst dann im **DAR-Terminal** die wartende DAR-Abfrage bestätigen.
 
-Die Schaltflächen verwenden normale LTFS-/FUSE-Kommandos (`ltfs -o devname=… MOUNTPOINT`; `fusermount3 -u`, ersatzweise `fusermount -u` oder `umount`). **Kein** Force-/Lazy-Unmount und **kein** automatisches Auswerfen, Formatieren oder Überschreiben. Ein Mountpoint mit einem anderen Dateisystem wird nicht ausgehängt.
+Die Schaltflächen verwenden normale LTFS-/FUSE-Kommandos (`ltfs -o devname=… MOUNTPOINT`; `fusermount3 -u`, ersatzweise `fusermount -u` oder `umount`). **Kein** Force-/Lazy-Unmount und **kein** automatisches Auswerfen, Formatieren oder Überschreiben; Formatieren ist ausschließlich über den gesonderten manuellen Dialog möglich. Ein Mountpoint mit einem anderen Dateisystem wird nicht ausgehängt.
 
 **Aktuelle Grenze:** Die Anwendung kann die DAR-Bandwechselaufforderung derzeit nicht zuverlässig aus dem Terminal erkennen. Die Koordination bleibt daher absichtlich manuell. Ein erfolgreicher Mount/Unmount ist erst auf einem realen LTFS-Laufwerk verifizierbar; hier wurden ausschließlich die Python-Kommandos getestet.
 
@@ -1091,3 +1091,18 @@ nicht implementiert, weil es vorhandene Daten zerstören kann.
 Nach dem optionalen `mt offline` erscheint eine weitere Statussperre: Erst
 wenn der Befehl im LTFS-Terminal beendet ist, über „Status / Abschluss
 bestätigen“ den Bandwechsel freigeben.
+
+### Manuelle Vorbereitung / Formatierung eines neuen LTFS-Bandes
+
+Eine neue Bandkassette muss vor dem LTFS-Mount gegebenenfalls formatiert werden.
+Dazu im LTFS-Reiter den eingeklappten Bereich **„Neues Band vorbereiten / LTFS-Formatierung (Datenverlust!)“** öffnen.
+
+1. Mit „LTFS-Laufwerke anzeigen“ und ggf. „Laufwerksstatus (mt)“ das richtige **physische Laufwerk** bestimmen; Bandetikett vor Ort kontrollieren. Das eingelegte Band muss ausdrücklich zur Neuformatierung freigegeben sein. **Ein unbekanntes Band ist nicht leer.**
+2. Sicherstellen, dass DAR nicht auf dieses Band schreibt und dass LTFS vollständig ausgehängt ist. Der Knopf ist bei gemountetem LTFS oder noch laufender LTFS-Operation gesperrt.
+3. „Formatierung prüfen …“ öffnen, die **Bandkennung vom physischen Etikett** eingeben, optional einen LTFS-Volumenamen festlegen. Alle drei Sicherheitsbestätigungen aktivieren. Zur letzten Freigabe `FORMATIEREN BANDKENNUNG` exakt eingeben und bestätigen.
+4. Die Anwendung startet **ausschließlich im LTFS-Terminal** `mkltfs -d GERÄT` (optional `-n NAME`) und zeigt dort den Exit-Code. Ohne `--force`, `--wipe` oder sonstige erzwungene Löschoptionen. **Auch ohne `--force` können Daten auf bislang nicht als LTFS formatierten Medien verloren gehen.**
+5. Erst **nach tatsächlichem Programmende** im LTFS-Terminal „3. Status / Abschluss bestätigen“ auswählen und Abschluss freigeben. Bei Erfolg (`Exit-Code: 0`) kann das Band danach wie gewohnt gemountet werden. Bei Fehlern zuerst die Terminalausgabe analysieren, niemals blind wiederholt formatieren.
+
+**Wesentliche Einschränkung:** Der zukünftige Medien-/Slice-Katalog existiert noch nicht. Die Anwendung kann folglich **nicht feststellen**, ob ein eingelegtes Band bereits Teil eines früheren Backups ist. Weder das Etikett noch die Bestätigung beweisen die Datenfreiheit. Ohne sichere Kenntnis der Bandhistorie **nicht formatieren**. Die endgültige kataloggestützte Formatierungssperre wird nach der LTFS-Grundintegration implementiert.
+
+Die GUI läuft ohne `sudo`. Zugriffsrechte müssen separat eingerichtet sein. Der manuelle Bandwechsel bleibt unabhängig: DAR wartet im eigenen Terminal, LTFS wird im zweiten Terminal bedient und abgeschlossen, DAR wird erst nach erfolgreichem Mount manuell fortgesetzt.

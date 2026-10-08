@@ -123,3 +123,69 @@ def build_tape_eject_command(device: str, *, executable: str | None = None) -> l
     if not binary:
         raise FileNotFoundError("'mt' ist nicht installiert oder nicht im PATH (z. B. Paket mt-st).")
     return [binary, "-f", validate_tape_device(device), "offline"]
+
+
+# Eine unbekannte Kassette gilt grundsätzlich NICHT als leer. Die
+# Hardware-/Katalogprüfung erfolgt in der GUI durch explizite Freigabe.
+def mkltfs_executable() -> str | None:
+    return shutil.which("mkltfs")
+
+
+def validate_format_device(device: str) -> str:
+    """Nur einzelne, eindeutige Laufwerks-IDs (keine Shell-/CLI-Optionen)."""
+    import re
+    value = device.strip()
+    # Nicht alle LTFS-Backends verwenden /dev/sg*: Seriennummern und
+    # Tape-Symlinks werden ebenfalls unterstützt.
+    allowed = (
+        re.fullmatch(r"/dev/(?:sg|nst|st)\d+", value)
+        or re.fullmatch(r"/dev/tape/by-id/[A-Za-z0-9_.:-]+", value)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{3,63}", value)
+    )
+    if not allowed:
+        raise ValueError(
+            "Als Formatiergerät nur /dev/sgN, /dev/stN, /dev/nstN, "
+            "/dev/tape/by-id/... oder eine eindeutige Laufwerksseriennummer angeben."
+        )
+    return value
+
+
+def validate_cartridge_label(label: str) -> str:
+    """Zur manuellen Gegenkontrolle des physischen Kassettenetiketts."""
+    import re
+    value = label.strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{1,31}", value):
+        raise ValueError("Bandkennung: 2–32 Zeichen (Buchstaben, Zahlen, - oder _).")
+    return value
+
+
+def build_format_command(device: str, *, volume_name: str = "",
+                         executable: str | None = None) -> list[str]:
+    """LTFS neu anlegen – nie --force, --wipe, --long-wipe oder sudo."""
+    binary = executable or mkltfs_executable()
+    if not binary:
+        raise FileNotFoundError("'mkltfs' ist nicht installiert oder nicht im PATH.")
+    command = [binary, "-d", validate_format_device(device)]
+    if any(ord(c) < 32 or ord(c) == 127 for c in volume_name):
+        raise ValueError("Ungültiger LTFS-Volumename (keine Steuerzeichen).")
+    name = volume_name.strip()
+    if name:
+        if len(name) > 64:
+            raise ValueError("Ungültiger LTFS-Volumename (maximal 64 Zeichen).")
+        command.extend(["-n", name])
+    return command
+
+
+def any_ltfs_mounted(*, mountinfo: str | None = None) -> bool:
+    """Konservative Schutzprüfung: kein Formatieren bei irgendeinem LTFS-Mount."""
+    if mountinfo is None:
+        try:
+            with open("/proc/self/mountinfo", encoding="utf-8") as handle:
+                mountinfo = handle.read()
+        except OSError as exc:
+            raise RuntimeError("Mount-Tabelle nicht lesbar; Formatierung gesperrt.") from exc
+    for line in mountinfo.splitlines():
+        _before, sep, after = line.partition(" - ")
+        if sep and after.split() and is_ltfs_filesystem(after.split()[0]):
+            return True
+    return False
