@@ -36,3 +36,12 @@ liegt weiterhin beim Benutzer.
 - Nach `mt offline` bleibt der nächste Mount gesperrt, bis der Benutzer den
   vollständig abgeschlossenen Auswurf ebenfalls über „Status / Abschluss
   bestätigen“ bestätigt.
+
+## Bedienoberfläche – höhenverstellbarer Terminalbereich (2026-10-08)
+
+- Der bisher starre vertikale Aufbau wurde durch ein `Gtk.Paned(VERTICAL)` ersetzt.
+- Oberer Bereich: Archivbaum und Dateitabelle mit vorhandener horizontaler Trennleiste.
+- Unterer Bereich: DAR-/LTFS-Terminal-Reiter und DAR-Log mit vorhandener horizontaler Trennleiste.
+- Die neue Trennleiste zwischen oberem und unterem Bereich lässt sich mit der Maus verschieben.
+- Unabhängige DAR- und LTFS-Prozesse bleiben unverändert; keine Prozessänderungen.
+- Initiale Trennposition: 425 Pixel; derzeit keine dauerhafte Speicherung der Fensteraufteilung.

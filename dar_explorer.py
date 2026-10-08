@@ -661,12 +661,15 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         self.column_view.add_controller(right_click)
 
         right_scroll = Gtk.ScrolledWindow()
-        right_scroll.set_min_content_height(400)
+        # A small minimum leaves room to resize the terminal area vertically.
+        right_scroll.set_min_content_height(180)
         right_scroll.set_vexpand(True)
         right_scroll.set_child(self.column_view)
 
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         paned.set_position(330)
+        paned.set_vexpand(True)
+        paned.set_hexpand(True)
         paned.set_start_child(tree_scroll)
         paned.set_end_child(right_scroll)
 
@@ -729,10 +732,27 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
         bottom.append(self.status_label)
         bottom.append(self.bottom_paned)
 
+        # Vertical GTK split: drag the handle between archive browser (top)
+        # and terminal/log area (bottom). The DAR and LTFS PTYs are unaffected.
+        self.main_vertical_paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        self.main_vertical_paned.set_vexpand(True)
+        self.main_vertical_paned.set_hexpand(True)
+        self.main_vertical_paned.set_position(425)
+        self.main_vertical_paned.set_start_child(paned)
+        self.main_vertical_paned.set_end_child(bottom)
+        self.main_vertical_paned.set_resize_start_child(True)
+        self.main_vertical_paned.set_resize_end_child(True)
+        self.main_vertical_paned.set_shrink_start_child(False)
+        self.main_vertical_paned.set_shrink_end_child(False)
+        self.main_vertical_paned.set_wide_handle(True)
+        self.main_vertical_paned.add_css_class("terminal-height-splitter")
+        self.main_vertical_paned.set_tooltip_text(
+            "Trennleiste ziehen: Archivansicht und Terminals in der Höhe anpassen"
+        )
+
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         main.append(info)
-        main.append(paned)
-        main.append(bottom)
+        main.append(self.main_vertical_paned)
 
         self.set_child(main)
         self._install_css()
@@ -1088,6 +1108,7 @@ class DarExplorerWindow(Gtk.ApplicationWindow):
             .path-label { font-family: monospace; }
             .dim-label { opacity: 0.75; }
             columnview row { padding-top: 2px; padding-bottom: 2px; }
+            paned.terminal-height-splitter > separator { min-height: 9px; }
             """
         )
         Gtk.StyleContext.add_provider_for_display(

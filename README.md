@@ -43,6 +43,24 @@ Ein besonderer Schwerpunkt liegt auf dem Umgang mit **geslicten, unvollständige
 
 ---
 
+## Fensteraufteilung: höhenverstellbares Terminal
+
+Zwischen **Archivansicht** (oben) und **Terminal-/Logbereich** (unten) befindet
+sich eine **mit der Maus verschiebbare horizontale Trennleiste**. Ziehe sie
+nach oben, um DAR-/LTFS-Terminal und Log mehr Höhe zu geben, oder nach unten,
+um die Dateitabelle zu vergrößern. Innerhalb des unteren Bereichs bleibt
+die bereits vorhandene vertikale Trennleiste zwischen Terminal und Log erhalten.
+
+Die Reiter **DAR-Terminal** und **LTFS-Terminal** nutzen unverändert zwei
+unabhängige VTE-Terminals mit eigenen Shells/PTYs. Weder das Ziehen der Leiste
+noch ein Reiterwechsel beendet oder pausiert einen laufenden Prozess. Der
+Schalter **Terminal & Log** kann die untere Ausgabe weiterhin ausblenden.
+
+Die Position der Trennleiste wird derzeit beim Neustart auf eine sinnvolle
+Ausgangsposition zurückgesetzt.
+
+---
+
 # Grundkonzept
 
 DAR speichert Archive häufig nicht als eine einzige Datei, sondern kann ein Archiv in mehrere sogenannte **Slices** aufteilen.
